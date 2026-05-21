@@ -49,46 +49,56 @@ Wraps [LibreCrawl](https://github.com/PhialsBasement/LibreCrawl) as a Claude MCP
 
 ---
 
-## What's new vs vanilla LibreCrawl
+## What LibreCrawl MCP gives you
 
-The base [LibreCrawl](https://github.com/PhialsBasement/LibreCrawl) is a great self-hosted crawler with a web UI. This MCP project adds:
+[LibreCrawl](https://github.com/PhialsBasement/LibreCrawl) is a powerful self-hosted SEO crawler. On its own you get a web UI and raw crawl data. This MCP layer turns it into a fully automated Claude-native audit engine — one sentence to Claude gets you a complete site audit, saved as a Markdown report, ready to act on.
 
-### Bug fixes
-- **Session persistence patch** — LibreCrawl has a bug where `session_id` is read before `get_or_create_crawler()` creates it, so `crawl_id` is always `null` and results never save to the database. The installer patches `main.py` automatically.
+### 19 tools, zero context-switching
 
-### MCP layer (new)
-- Exposes LibreCrawl as **13 Claude tools** — Claude can crawl, poll, export, analyse, and report in a single conversation
-- Persistent `httpx.Client` with auto re-auth on 401 (cookie jar maintained across all tool calls)
-- One-call `librecrawl_audit()` — crawls, waits, exports, generates report, runs site checks — no manual steps
+Claude gains **19 specialised SEO tools**. Ask in plain English — Claude picks the right tool, runs it, interprets the output, and gives you a fix plan. No dashboards to navigate, no exports to download, no manual cross-referencing.
 
-### Report engine (new)
-The raw LibreCrawl export becomes a **structured Markdown report** with 30+ checks across 10 sections:
+- `librecrawl_audit()` — one call: crawls the site, runs site-level checks, generates a structured Markdown report with a prioritised fix checklist. Done.
+- Persistent authenticated session across all tool calls — no re-login between steps
+- Every crawl saved to SQLite with full history via `librecrawl_list_crawls()`
 
-| Section | Checks |
-|---------|--------|
-| Summary scorecard | 25 metrics at a glance |
-| Critical issues | Broken pages with source URLs, bad canonicals, duplicate titles |
-| Warnings | Missing meta, meta length, missing H1, thin content, slow pages |
-| H1 ↔ Title alignment | Keyword overlap check — flags topical mismatch |
-| Canonical analysis | Missing, self-referencing, non-self, pointing to 4xx |
-| Images | Missing alt text (per-page count), broken image srcs |
-| Noindex pages | All pages with `robots: noindex` — review accidental noindex |
-| Orphan pages | Zero inbound links — Google can't discover these |
-| Open Graph / Viewport | OG tags for social sharing, viewport for mobile |
-| Redirects + chains | Multi-hop redirect chains, not just 3xx presence |
-| Technical / URL quality | Uppercase slugs, long URLs, param-heavy URLs, depth >4 |
-| Site-level checks | robots.txt, sitemap.xml, HTTPS, www redirect |
-| Hreflang | Language variant detection |
-| Issues breakdown | LibreCrawl's 1,600+ issue type counts |
-| Fix checklist | Auto-prioritised P1→Pn task list |
+### Report engine — 35+ checks, 12 sections
 
-### Additional tools (new)
-- `librecrawl_site_check` — instant robots.txt + sitemap + HTTPS + www check, no crawl needed
-- `librecrawl_pagespeed` — Core Web Vitals via Google PSI API (free, 25k req/day)
-- `librecrawl_pagespeed_audit` — batch CWV check across top pages, ranked worst first
-- `librecrawl_schema_check` — Schema.org / JSON-LD extraction and rich-result mapping
-- `librecrawl_schema_audit` — schema coverage across multiple pages
-- `librecrawl_append_gsc_section` — append Google Search Console errors to any audit report
+LibreCrawl's raw JSON export gets transformed into a structured audit report covering everything Screaming Frog covers, plus things it doesn't:
+
+| Section | What it catches |
+|---------|----------------|
+| Summary scorecard | 30+ metrics with pass/fail at a glance |
+| Critical issues | Broken pages + which pages link to them, duplicate titles, bad canonicals |
+| On-page warnings | Meta length, missing H1, thin content, slow response time |
+| H1 ↔ Title alignment | Keyword mismatch check — flags pages where headings contradict title intent |
+| Canonical analysis | Missing, self-referencing, non-self, canonical → broken URL |
+| Images | Missing alt text (per-page count + total), broken image references |
+| Noindex detection | Every page with `robots: noindex` — catch accidental SEO blackouts |
+| Orphan pages | Pages with zero inbound links — invisible to Googlebot |
+| Redirect chains | Multi-hop chains (A→B→C), not just 3xx presence |
+| Open Graph + Viewport | Social sharing tags, mobile viewport — affects CTR and ranking |
+| Heading structure | Pages with content but no H2s, broken H1→H2 hierarchy |
+| Analytics coverage | Pages missing GA4 or GTM — tracking blind spots |
+| URL quality | Uppercase slugs, long URLs, parameter-heavy URLs, depth >4 |
+| Site-level checks | robots.txt rules, sitemap.xml, HTTPS redirect, www canonicalisation |
+| Hreflang | Language variant detection for multilingual sites |
+| Issue type breakdown | LibreCrawl's 1,600+ built-in issue detectors, counted by type |
+| Fix checklist | Auto-prioritised P1→Pn task list — paste straight into your tracker |
+
+### Beyond crawl data — 6 specialist tools
+
+| Tool | Value |
+|------|-------|
+| `librecrawl_site_check` | Instant technical health — robots.txt, sitemap, HTTPS, www. No crawl needed. |
+| `librecrawl_pagespeed` | Google PageSpeed Insights: Core Web Vitals, LCP/CLS/INP, lab + field data |
+| `librecrawl_pagespeed_audit` | Batch CWV across top pages — ranked worst first, throttled to stay in free quota |
+| `librecrawl_schema_check` | Extract all JSON-LD from a page, map to rich results they unlock (FAQ, Product, Breadcrumb…) |
+| `librecrawl_schema_audit` | Schema coverage across 50 pages at once |
+| `librecrawl_internal_links_analysis` | Internal authority map: top-linked pages, dead ends, orphans, anchor text patterns |
+
+### GSC integration
+
+Connect any Google Search Console MCP (we recommend [mcp-gsc](https://github.com/AminForou/mcp-gsc)) and Claude will pull your real indexing errors — 404s in sitemap, server errors, soft 404s, crawl blocks — and append them to the audit report with fix hints. One conversation, complete picture.
 
 ---
 
@@ -102,10 +112,10 @@ curl -fsSL https://raw.githubusercontent.com/adityaarsharma/librecrawl-mcp/main/
 
 The installer:
 1. Clones LibreCrawl and builds the Docker image (~5–8 min first run)
-2. Applies the session persistence bug fix to `main.py`
+2. Applies all required patches to `main.py` for full DB persistence
 3. Installs the Python MCP server in an isolated venv
 4. Registers both services with PM2 (`restart: always`, survives reboots)
-5. Prompts for optional Google PageSpeed Insights API key (free)
+5. Prompts for optional Google PageSpeed Insights API key (free, 25k req/day)
 
 ### Custom install directory or ports
 
@@ -340,22 +350,6 @@ docker stop librecrawl
 | `MCP_PORT` | `5081` | MCP server port |
 | `PAGESPEED_API_KEY` | — | Google PSI API key (free at console.cloud.google.com) |
 | `REPORTS_DIR` | `~/librecrawl-reports` | Where Markdown reports are saved |
-
----
-
-## What the session patch fixes
-
-LibreCrawl has a bug where `session_id` is read before `get_or_create_crawler()` creates it, so `crawl_id` is always `null` and crawl results never save to the database. The installer patches this automatically:
-
-```python
-# Before (broken): session_id is None, DB save fails silently
-session_id = session.get('session_id')   # → always None
-crawler = get_or_create_crawler()
-
-# After (fixed): read AFTER creation
-crawler = get_or_create_crawler()
-session_id = session.get('session_id')  # → correct value
-```
 
 ---
 
