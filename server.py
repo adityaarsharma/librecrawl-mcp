@@ -25,11 +25,25 @@ REPORTS_DIR     = Path(os.getenv('REPORTS_DIR', Path.home() / 'librecrawl-report
 PSI_API_KEY     = os.getenv('PAGESPEED_API_KEY', '')   # Google PageSpeed Insights
 PSI_API_BASE    = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
-# Fields we request on every export — links_detailed enables broken-link-source tracking
+# Fields we request on every export
+# LibreCrawl exposes all of these from its seo_extractor — we request the full set
 EXPORT_FIELDS = [
+    # Core
     "url", "status_code", "title", "meta_description", "h1",
     "word_count", "canonical_url", "depth", "issues_detected",
-    "response_time_ms", "links_detailed",
+    "response_time_ms",
+    # Headings
+    "h2", "h3",
+    # Links
+    "links_detailed", "internal_links", "external_links", "linked_from",
+    # Images
+    "images", "broken_images",
+    # Technical
+    "robots", "lang", "charset", "viewport", "size", "redirects", "error_type",
+    # Social / structured
+    "og_tags", "twitter_tags", "json_ld", "hreflang",
+    # Analytics fingerprint
+    "analytics",
 ]
 
 _client = None
@@ -207,34 +221,55 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
     thin_content     = []
     dup_titles       = defaultdict(list)
     dup_metas        = defaultdict(list)
-    slow_pages       = []
-    no_canonical     = []      # missing canonical tag
-    self_canonical   = []      # canonical == self (good, just counted)
-    non_self_canonical = []    # canonical points elsewhere
-    bad_canonical    = []      # canonical points to broken URL
-    uppercase_urls   = []
-    long_urls        = []      # >115 chars
-    deep_pages       = []      # depth > 4
-    h1_title_mismatch = []     # H1 and title share 0 words
-    url_params_heavy = []      # >3 query params
-    issues_type_count = defaultdict(int)
+    slow_pages         = []
+    no_canonical       = []      # missing canonical tag
+    self_canonical     = []      # canonical == self (good, counted)
+    non_self_canonical = []      # canonical points elsewhere
+    bad_canonical      = []      # canonical → broken URL
+    uppercase_urls     = []
+    long_urls          = []      # >115 chars
+    deep_pages         = []      # depth > 4
+    h1_title_mismatch  = []      # H1 and title share 0 meaningful words
+    url_params_heavy   = []      # >3 query params
+    # New from full field set
+    noindex_pages      = []      # robots meta = noindex
+    large_pages        = []      # page body > 500KB
+    missing_alt_pages  = []      # (url, count_missing) — images with no alt
+    broken_img_pages   = []      # (url, count) — broken image srcs
+    orphan_pages       = []      # linked_from empty (no inbound links)
+    redirect_chains    = []      # redirect depth > 1 hop
+    missing_og_pages   = []      # no og:title or og:description
+    missing_viewport   = []      # no viewport meta (mobile-hostile)
+    hreflang_pages     = []      # pages declaring hreflang
+    issues_type_count  = defaultdict(int)
+    all_page_urls      = set()   # all crawled URLs (for orphan check)
 
     for p in pages:
-        url       = p.get("url", "")
-        status    = p.get("status_code", 0)
-        title     = (p.get("title") or "").strip()
-        meta      = (p.get("meta_description") or "").strip()
-        h1        = (p.get("h1") or "").strip()
-        words     = p.get("word_count", 0) or 0
-        rt        = p.get("response_time_ms", 0) or 0
-        canonical = (p.get("canonical_url") or "").strip()
-        depth     = p.get("depth") or 0
-        issues    = p.get("issues_detected") or []
+        url         = p.get("url", "")
+        status      = p.get("status_code", 0)
+        title       = (p.get("title") or "").strip()
+        meta        = (p.get("meta_description") or "").strip()
+        h1          = (p.get("h1") or "").strip()
+        words       = p.get("word_count", 0) or 0
+        rt          = p.get("response_time_ms", 0) or 0
+        canonical   = (p.get("canonical_url") or "").strip()
+        depth       = p.get("depth") or 0
+        issues      = p.get("issues_detected") or []
+        robots_meta = (p.get("robots") or "").lower()
+        page_size   = p.get("size") or 0
+        images      = p.get("images") or []
+        b_images    = p.get("broken_images") or []
+        linked_from = p.get("linked_from") or []
+        redirects_chain = p.get("redirects") or []
+        og_tags     = p.get("og_tags") or {}
+        viewport    = (p.get("viewport") or "").strip()
+        hreflang    = p.get("hreflang") or []
 
+        all_page_urls.add(url)
         status_str = str(status)
         status_buckets[status_str[:1] + "xx"].append(url)
 
-        # On-page checks (only for 2xx pages)
+        # On-page checks (2xx pages only)
         if status_str.startswith("2"):
             if not title:             missing_title.append(url)
             if not meta:              missing_meta.append(url)
@@ -257,25 +292,64 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
             else:
                 non_self_canonical.append((url, canonical))
 
-            # H1 vs title mismatch (no shared content words)
+            # H1 vs title mismatch
             if title and h1:
-                title_words = set(re.sub(r'[^a-z0-9 ]', '', title.lower()).split())
-                h1_words    = set(re.sub(r'[^a-z0-9 ]', '', h1.lower()).split())
-                stopwords   = {'the','a','an','and','or','for','in','on','at','to','of','is','are'}
-                title_kw    = title_words - stopwords
-                h1_kw       = h1_words - stopwords
-                if title_kw and h1_kw and not title_kw.intersection(h1_kw):
+                stopwords = {'the','a','an','and','or','for','in','on','at','to','of','is','are'}
+                t_kw = set(re.sub(r'[^a-z0-9 ]','',title.lower()).split()) - stopwords
+                h_kw = set(re.sub(r'[^a-z0-9 ]','',h1.lower()).split()) - stopwords
+                if t_kw and h_kw and not t_kw.intersection(h_kw):
                     h1_title_mismatch.append((url, title[:60], h1[:60]))
 
             # Depth
             if depth > 4:
                 deep_pages.append((url, depth))
 
-        # URL quality (all pages)
+            # Noindex via robots meta tag
+            if "noindex" in robots_meta:
+                noindex_pages.append((url, robots_meta))
+
+            # Page size > 500KB (heavy page)
+            if page_size > 500_000:
+                large_pages.append((url, page_size))
+
+            # Image alt text
+            if isinstance(images, list):
+                no_alt = sum(1 for img in images
+                             if isinstance(img, dict) and not (img.get("alt") or "").strip())
+                if no_alt:
+                    missing_alt_pages.append((url, no_alt))
+
+            # Broken images
+            if isinstance(b_images, list) and b_images:
+                broken_img_pages.append((url, len(b_images), b_images[:5]))
+
+            # Orphan page (no inbound links at all)
+            if not linked_from:
+                orphan_pages.append(url)
+
+            # Redirect chain (page itself underwent >1 redirect to get here)
+            if isinstance(redirects_chain, list) and len(redirects_chain) > 1:
+                redirect_chains.append((url, len(redirects_chain), redirects_chain[:3]))
+
+            # Open Graph tags
+            og_title = og_tags.get("og:title") or og_tags.get("title") or ""
+            og_desc  = og_tags.get("og:description") or og_tags.get("description") or ""
+            if not og_title or not og_desc:
+                missing_og_pages.append(url)
+
+            # Viewport (mobile friendliness)
+            if not viewport:
+                missing_viewport.append(url)
+
+            # Hreflang
+            if isinstance(hreflang, list) and hreflang:
+                hreflang_pages.append((url, hreflang))
+
+        # URL quality (all status codes)
         parsed_url = urlparse(url)
-        path       = parsed_url.path
+        upath      = parsed_url.path
         query      = parsed_url.query
-        if path != path.lower():
+        if upath != upath.lower():
             uppercase_urls.append(url)
         if len(url) > 115:
             long_urls.append((url, len(url)))
@@ -288,7 +362,7 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
                 if isinstance(iss, str):
                     issues_type_count[iss] += 1
                 elif isinstance(iss, dict):
-                    issues_type_count[iss.get("type", "unknown")] += 1
+                    issues_type_count[iss.get("type","unknown")] += 1
         elif isinstance(issues, str) and issues:
             issues_type_count[issues] += 1
 
@@ -343,6 +417,13 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
     lines.append(f"| Deep pages (depth >4) | {len(deep_pages)} | {'✅' if not deep_pages else '⚠️'} |")
     lines.append(f"| Uppercase in URL | {len(uppercase_urls)} | {'✅' if not uppercase_urls else '⚠️'} |")
     lines.append(f"| URL too long (>115c) | {len(long_urls)} | {'✅' if not long_urls else '⚠️'} |")
+    lines.append(f"| Noindex pages | {len(noindex_pages)} | {'✅' if not noindex_pages else '⚠️ check each'} |")
+    lines.append(f"| Images missing alt | {len(missing_alt_pages)} pages | {'✅' if not missing_alt_pages else '⚠️'} |")
+    lines.append(f"| Broken images | {len(broken_img_pages)} pages | {'✅' if not broken_img_pages else '🔴'} |")
+    lines.append(f"| Orphan pages | {len(orphan_pages)} | {'✅' if not orphan_pages else '⚠️'} |")
+    lines.append(f"| Redirect chains (>1 hop) | {len(redirect_chains)} | {'✅' if not redirect_chains else '⚠️'} |")
+    lines.append(f"| Missing OG tags | {len(missing_og_pages)} | {'✅' if not missing_og_pages else '⚠️'} |")
+    lines.append(f"| Missing viewport meta | {len(missing_viewport)} | {'✅' if not missing_viewport else '🔴'} |")
     lines.append("")
     sep()
 
@@ -633,6 +714,106 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
         lines.append("")
         sep()
 
+    # ── Images ────────────────────────────────────────────────────────────────
+    if missing_alt_pages or broken_img_pages:
+        h(2, "🖼️ Images")
+        if missing_alt_pages:
+            h(3, f"Images Missing Alt Text ({len(missing_alt_pages)} pages)")
+            lines.append("> **Fix:** Add descriptive `alt` attributes. Critical for accessibility and image search.\n")
+            lines.append("| URL | Images Missing Alt |")
+            lines.append("|-----|-------------------|")
+            total_missing = sum(c for _, c in missing_alt_pages)
+            for url, count in sorted(missing_alt_pages, key=lambda x: -x[1])[:20]:
+                lines.append(f"| `{url}` | {count} |")
+            lines.append(f"\n**Total images missing alt:** {total_missing}\n")
+        if broken_img_pages:
+            h(3, f"Broken Images ({len(broken_img_pages)} pages)")
+            lines.append("> **Fix:** Upload missing images or update src URLs.\n")
+            for url, count, samples in broken_img_pages[:15]:
+                lines.append(f"**{url}** — {count} broken image(s)")
+                for img in samples[:3]:
+                    src = img.get("src") or img if isinstance(img, str) else str(img)
+                    li(f"`{src}`")
+                lines.append("")
+        sep()
+
+    # ── Noindex pages ─────────────────────────────────────────────────────────
+    if noindex_pages:
+        h(2, f"🚫 Noindex Pages ({len(noindex_pages)})")
+        lines.append("> Review each — noindex intentionally hides a page from Google. "
+                     "Accidental noindex on important pages = invisible to search.\n")
+        lines.append("| URL | Robots Meta |")
+        lines.append("|-----|------------|")
+        for url, robots_val in noindex_pages[:30]:
+            lines.append(f"| `{url}` | `{robots_val}` |")
+        if len(noindex_pages) > 30:
+            lines.append(f"| … | {len(noindex_pages)-30} more |")
+        lines.append("")
+        sep()
+
+    # ── Orphan pages ─────────────────────────────────────────────────────────
+    if orphan_pages:
+        h(2, f"👻 Orphan Pages — No Inbound Links ({len(orphan_pages)})")
+        lines.append("> These pages have zero internal links pointing to them. "
+                     "Google rarely discovers or ranks pages it can't reach via internal linking.\n")
+        lines.append("> **Fix:** Add internal links from relevant pages, or noindex if they're utility pages.\n")
+        for url in orphan_pages[:20]:
+            li(f"`{url}`")
+        if len(orphan_pages) > 20:
+            lines.append(f"… and {len(orphan_pages)-20} more")
+        lines.append("")
+        sep()
+
+    # ── Redirect chains ───────────────────────────────────────────────────────
+    if redirect_chains:
+        h(2, f"⛓️ Redirect Chains — More Than 1 Hop ({len(redirect_chains)})")
+        lines.append("> **Fix:** Redirect directly to the final URL. Each extra hop wastes crawl budget and loses link equity.\n")
+        lines.append("| Final URL | Chain Length | Chain |")
+        lines.append("|-----------|-------------|-------|")
+        for url, depth_val, chain in redirect_chains[:15]:
+            chain_str = " → ".join(f"`{u}`" for u in chain[:3])
+            lines.append(f"| `{url}` | {depth_val} | {chain_str} |")
+        lines.append("")
+        sep()
+
+    # ── Open Graph ────────────────────────────────────────────────────────────
+    if missing_og_pages:
+        h(2, f"📱 Missing Open Graph Tags ({len(missing_og_pages)} pages)")
+        lines.append("> **Fix:** Add `og:title`, `og:description`, `og:image` to every page. "
+                     "Controls how pages appear when shared on Facebook, LinkedIn, Slack, etc.\n")
+        for url in missing_og_pages[:20]:
+            li(f"`{url}`")
+        if len(missing_og_pages) > 20:
+            lines.append(f"… and {len(missing_og_pages)-20} more")
+        lines.append("")
+        sep()
+
+    # ── Viewport / mobile ─────────────────────────────────────────────────────
+    if missing_viewport:
+        h(2, f"📵 Missing Viewport Meta ({len(missing_viewport)} pages)")
+        lines.append("> **Fix:** Add `<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">`. "
+                     "Without it, Google treats the page as non-mobile-friendly.\n")
+        for url in missing_viewport[:20]:
+            li(f"`{url}`")
+        lines.append("")
+        sep()
+
+    # ── Hreflang ─────────────────────────────────────────────────────────────
+    if hreflang_pages:
+        h(2, f"🌍 Hreflang ({len(hreflang_pages)} pages declare it)")
+        lines.append("> Pages using hreflang — verify each language variant has a reciprocal return tag.\n")
+        lang_count = defaultdict(int)
+        for url, tags in hreflang_pages:
+            for tag in (tags if isinstance(tags, list) else []):
+                lang = tag.get("lang") or tag.get("hreflang") or str(tag)
+                lang_count[lang] += 1
+        lines.append("| Language | Pages |")
+        lines.append("|----------|-------|")
+        for lang, count in sorted(lang_count.items(), key=lambda x: -x[1])[:15]:
+            lines.append(f"| `{lang}` | {count} |")
+        lines.append("")
+        sep()
+
     # ── Issues breakdown (LibreCrawl's own detector) ──────────────────────────
     if issues_type_count:
         h(2, "🐛 Issue Type Breakdown (LibreCrawl detector)")
@@ -694,6 +875,13 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
         (slow_pages,       f"Fix {len(slow_pages)} slow pages (>3s response time)"),
         (h1_title_mismatch, f"Align H1 and title keywords on {len(h1_title_mismatch)} pages"),
         (redirect,         f"Update internal links for {len(redirect)} redirect targets"),
+        (broken_img_pages, f"Fix broken images on {len(broken_img_pages)} pages"),
+        (missing_alt_pages, f"Add alt text to images on {len(missing_alt_pages)} pages"),
+        (orphan_pages,     f"Add internal links to {len(orphan_pages)} orphan pages"),
+        (redirect_chains,  f"Collapse {len(redirect_chains)} redirect chains to single hops"),
+        (missing_viewport, f"Add viewport meta to {len(missing_viewport)} pages"),
+        (missing_og_pages, f"Add OG tags to {len(missing_og_pages)} pages"),
+        (noindex_pages,    f"Review {len(noindex_pages)} noindex pages — verify intentional"),
         (uppercase_urls,   f"Lowercase {len(uppercase_urls)} URLs with uppercase characters"),
         (long_urls,        f"Shorten {len(long_urls)} URLs over 115 chars"),
         (deep_pages,       f"Improve crawlability: {len(deep_pages)} pages at depth >4"),
