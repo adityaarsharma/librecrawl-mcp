@@ -47,6 +47,40 @@ EXPORT_FIELDS = [
     "analytics",
 ]
 
+def _parse_export(export) -> tuple:
+    """
+    Parse LibreCrawl export response into (pages, links).
+    Handles both direct list/dict formats and the multi-file
+    {"files": [{"content": "...", "filename": "..."}]} format.
+    """
+    import json as _json
+    if isinstance(export, list):
+        return export, []
+    # Direct dict with known key
+    for key in ("data", "urls", "pages"):
+        if key in export and isinstance(export[key], list):
+            return export[key], []
+    # Multi-file format: {"files": [...], "multiple_files": true}
+    pages, links = [], []
+    for f in (export.get("files") or []):
+        filename = f.get("filename", "")
+        raw      = f.get("content", "")
+        if not raw:
+            continue
+        try:
+            parsed = _json.loads(raw)
+        except Exception:
+            continue
+        if "export" in filename:
+            for key in ("data", "urls", "pages"):
+                if key in parsed and isinstance(parsed[key], list):
+                    pages = parsed[key]
+                    break
+        elif "links" in filename and isinstance(parsed, list):
+            links = parsed
+    return pages, links
+
+
 _client = None
 _client_lock = threading.Lock()
 
@@ -192,7 +226,7 @@ def _site_check(base_url: str) -> dict:
 # ── Report generator ──────────────────────────────────────────────────────────
 
 def _build_report(pages: list, base_url: str, crawl_id: int,
-                  site_data: dict = None) -> str:
+                  site_data: dict = None, links: list = None) -> str:
     """Generate a structured Markdown SEO audit report from crawl export data."""
 
     domain = base_url.replace("https://", "").replace("http://", "").rstrip("/")
@@ -203,16 +237,23 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
     base_host   = parsed_base.netloc or domain
 
     # ── Build reverse link map (source of broken links) ──────────────────────
-    # links_detailed: list of {url, anchor_text, is_internal, ...} per page
+    # Prefer flat links file (LibreCrawl multi-file export); fall back to links_detailed per page
     inbound = defaultdict(list)   # target_url → [source_urls]
-    for p in pages:
-        src   = p.get("url", "")
-        links = p.get("links_detailed") or []
-        if isinstance(links, list):
-            for lk in links:
-                tgt = lk.get("url") or lk.get("href") or ""
-                if tgt:
-                    inbound[tgt].append(src)
+    if links:
+        for lk in links:
+            src = lk.get("source_url", "")
+            tgt = lk.get("target_url", "")
+            if src and tgt:
+                inbound[tgt].append(src)
+    else:
+        for p in pages:
+            src      = p.get("url", "")
+            pg_links = p.get("links_detailed") or []
+            if isinstance(pg_links, list):
+                for lk in pg_links:
+                    tgt = lk.get("url") or lk.get("href") or ""
+                    if tgt:
+                        inbound[tgt].append(src)
 
     # ── Categorise pages ──────────────────────────────────────────────────────
     status_buckets   = defaultdict(list)
@@ -833,9 +874,14 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
         url = p.get("url", "")
         if analytics:
             # Count which tools are present across site
-            for tool in ["ga4_id","gtm_id","fb_pixel","hotjar","mixpanel"]:
-                if analytics.get(tool):
-                    analytics_tool_count[tool] += 1
+            tool_keys = {
+                "ga4_id": "ga4_id", "gtm_id": "gtm_id",
+                "fb_pixel": "facebook_pixel",   # LibreCrawl uses facebook_pixel
+                "hotjar": "hotjar", "mixpanel": "mixpanel",
+            }
+            for label, key in tool_keys.items():
+                if analytics.get(key):
+                    analytics_tool_count[label] += 1
             if not analytics.get("ga4_id"):
                 pages_no_ga4.append(url)
             if not analytics.get("gtm_id"):
@@ -1062,9 +1108,7 @@ def librecrawl_audit(url: str, max_pages: int = 500) -> dict:
         "fields": EXPORT_FIELDS,
     }, timeout=300)
     r.raise_for_status()
-    export = r.json()
-
-    pages = export if isinstance(export, list) else export.get("urls", export.get("pages", []))
+    pages, links = _parse_export(r.json())
 
     if not pages:
         return {
@@ -1075,7 +1119,7 @@ def librecrawl_audit(url: str, max_pages: int = 500) -> dict:
         }
 
     # Generate and save report
-    report_md   = _build_report(pages, url, crawl_id or 0, site_data=site_data)
+    report_md   = _build_report(pages, url, crawl_id or 0, site_data=site_data, links=links)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     domain      = url.replace("https://","").replace("http://","").rstrip("/").split("/")[0]
     timestamp   = datetime.now().strftime("%Y%m%d-%H%M")
@@ -1147,9 +1191,7 @@ def librecrawl_generate_report(crawl_id: int = None) -> dict:
         "fields": EXPORT_FIELDS,
     }, timeout=300)
     r.raise_for_status()
-    export = r.json()
-
-    pages = export if isinstance(export, list) else export.get("urls", export.get("pages", []))
+    pages, links = _parse_export(r.json())
 
     if not pages:
         return {"success": False, "error": "No pages found. Is the crawl complete?"}
@@ -1158,7 +1200,7 @@ def librecrawl_generate_report(crawl_id: int = None) -> dict:
         parsed   = urlparse(pages[0].get("url", ""))
         base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-    report_md   = _build_report(pages, base_url, crawl_id or 0)
+    report_md   = _build_report(pages, base_url, crawl_id or 0, links=links)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     domain      = base_url.replace("https://","").replace("http://","").rstrip("/").split("/")[0]
     timestamp   = datetime.now().strftime("%Y%m%d-%H%M")
@@ -1235,7 +1277,8 @@ def librecrawl_export_results(crawl_id: int = None) -> dict:
         "fields": EXPORT_FIELDS,
     }, timeout=300)
     r.raise_for_status()
-    return r.json()
+    pages, links = _parse_export(r.json())
+    return {"pages": pages, "links": links, "total": len(pages)}
 
 
 @mcp.tool()
@@ -1336,8 +1379,19 @@ def librecrawl_internal_links_analysis(crawl_id: int = None) -> dict:
                    "internal_links", "external_links", "links_detailed", "linked_from"],
     }, timeout=300)
     r.raise_for_status()
-    export = r.json()
-    pages  = export if isinstance(export, list) else export.get("urls", export.get("pages", []))
+    pages, links = _parse_export(r.json())
+    # Merge flat links file into per-page links_detailed for analysis
+    if links and not any(p.get("links_detailed") for p in pages):
+        from collections import defaultdict as _dd
+        src_links = _dd(list)
+        for lk in links:
+            src_links[lk.get("source_url","")].append({
+                "url":         lk.get("target_url",""),
+                "anchor_text": lk.get("anchor_text",""),
+                "is_internal": bool(lk.get("is_internal", 0)),
+            })
+        for p in pages:
+            p["links_detailed"] = src_links.get(p.get("url",""), [])
 
     if not pages:
         return {"success": False, "error": "No pages found."}
