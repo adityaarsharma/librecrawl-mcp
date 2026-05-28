@@ -13,12 +13,46 @@ Works with **any MCP-compatible AI agent** — Claude, Cursor, Windsurf, OpenAI 
 
 ---
 
+### What's new in v1.1.1
+
+- **🆕 `librecrawl_resume_from_crawl_id(crawl_id)`** — crawl a huge site in chunks across days, sessions, and server restarts. Pause now, resume tomorrow from a different MCP session — picks up at the exact URL it stopped on, re-uses every page already crawled, zero duplicate requests to the target server. The "however big, in chunks, polite to the server" feature.
+
 ### What's new in v1.1.0
 
 - **Auto-recovery from stuck crawler** — `librecrawl_audit()` and `librecrawl_start_crawl()` now silently reset paused/stale crawler state before starting a new run. No more *"Crawl already in progress"* errors after a previous session was interrupted. Run a fresh audit anytime — it just works.
 - **GSC top queries section** — the report now includes a top-25 search queries table (clicks, impressions, CTR, position) automatically appended via `librecrawl_append_gsc_section()`.
 - **🎯 Quick wins detection** — page-2 keywords (positions 6-20) with high impressions are auto-surfaced as optimisation opportunities.
 - **Flat-or-nested GSC input** — `gsc_data` now accepts performance metrics either nested under `performance` or flat at the top level. Whichever your GSC MCP returns, it just works.
+
+---
+
+## Crawling huge sites politely
+
+LibreCrawl MCP is built to handle sites of any size without putting load on the target server, and to crawl in chunks across multiple sessions.
+
+**Polite by default:**
+- **Token-bucket rate limiter** — smooth distribution, no bursting. Default `crawlDelay: 0.5s` = 2 requests/second.
+- **Respects `Crawl-Delay` directive in robots.txt** — if your target sets `Crawl-Delay: 5`, LibreCrawl will wait 5s between requests.
+- **Same User-Agent across the crawl** — `LibreCrawl/1.0 (Web Crawler)`, identifiable and well-behaved.
+- **Single connection, sequential by default** — no parallel hammering. Configurable up to 5 concurrent workers if you control the server.
+
+**Crawl in chunks:**
+
+```text
+Day 1:  Audit https://huge-site.com (max 5000 pages)
+        → runs, returns crawl_id 42
+        → pause anytime with librecrawl_pause_crawl()
+
+Day 2:  list_crawls() → see crawl_id 42 with status "paused" at 1,847 pages
+        librecrawl_resume_from_crawl_id(42)
+        → picks up at page 1,848 — every previously-crawled URL is re-used from
+          the SQLite DB, no duplicate HTTP requests to the target
+
+Day 3:  Same thing — resume_from_crawl_id(42) until done
+        → generate_report(42) for the full Markdown audit
+```
+
+State persists across PM2 restarts, server reboots, and entirely different MCP client sessions. The crawl is keyed by `crawl_id`, not by the MCP session.
 
 ---
 
@@ -65,9 +99,9 @@ Works with **any MCP-compatible AI agent** — Claude, Cursor, Windsurf, OpenAI 
 
 [LibreCrawl](https://github.com/PhialsBasement/LibreCrawl) is a powerful self-hosted SEO crawler. On its own you get a web UI and raw crawl data. This MCP layer turns it into a fully automated AI-native audit engine — one sentence gets you a complete site audit, saved as a Markdown report, ready to act on.
 
-### 19 tools, works with any AI agent
+### 20 tools, works with any AI agent
 
-Your AI gains **19 specialised SEO tools**. Ask in plain English — the AI picks the right tool, runs it, interprets the output, and gives you a fix plan. No dashboards to navigate, no exports to download, no manual cross-referencing.
+Your AI gains **20 specialised SEO tools**. Ask in plain English — the AI picks the right tool, runs it, interprets the output, and gives you a fix plan. No dashboards to navigate, no exports to download, no manual cross-referencing.
 
 - `librecrawl_audit()` — one call: crawls the site, runs site-level checks, generates a structured Markdown report with a prioritised fix checklist. Done.
 - Persistent authenticated session across all tool calls — no re-login between steps

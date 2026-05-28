@@ -156,33 +156,39 @@ def _ensure_crawler_ready() -> dict:
     status_str = (s.get("status") or "").lower()
     crawled    = stats.get("crawled", 0)
 
-    # Paused crawl — stop it so the next start_crawl is clean
+    # Paused crawl — upstream reports this as status="running" + is_running=True (paused
+    # is an internal flag, not surfaced in get_status). Probe via crawl speed: a paused
+    # crawler has speed=0 for sustained periods even though is_running=True.
     if status_str == "paused":
         state["was_paused"] = True
         try:
             call("POST", "/api/stop_crawl")
+            time.sleep(1.5)
             state["action"] = "stopped_paused"
         except Exception:
             pass
         return state
 
-    # Running — if it has progress within the last minute, leave it alone (caller's choice).
-    # If it's running but stale, force-stop.
+    # Running — detect a stuck/paused/zombie crawler:
+    #   - speed == 0 (no requests/sec) for an active crawl = paused or wedged
+    #   - 0 pages crawled but is_running=True for >30s = zombie
+    # In either case, force-stop so the next start_crawl is clean.
     if is_running or status_str in ("running", "crawling"):
         state["was_running"] = True
-        last_update = stats.get("last_url_time") or stats.get("start_time") or 0
-        # If we can't measure progress, assume safe to leave alone
+        speed   = stats.get("speed", 0) or 0
+        elapsed = 0
         try:
-            age = time.time() - float(last_update) if last_update else 0
+            elapsed = time.time() - float(stats.get("start_time", 0) or 0)
         except Exception:
-            age = 0
-        if age > 60 or crawled == 0:
+            pass
+        is_likely_paused = (elapsed > 5 and speed == 0)
+        is_zombie        = (crawled == 0 and elapsed > 30)
+        if is_likely_paused or is_zombie:
             state["was_stale"] = True
             try:
                 call("POST", "/api/stop_crawl")
-                # Give the worker thread a tick to release the lock
                 time.sleep(1.5)
-                state["action"] = "stopped_stale"
+                state["action"] = "stopped_likely_paused" if is_likely_paused else "stopped_zombie"
             except Exception:
                 pass
     return state
@@ -1429,12 +1435,84 @@ def librecrawl_pause_crawl() -> dict:
 
 @mcp.tool()
 def librecrawl_resume_crawl() -> dict:
-    """Resume a paused crawl."""
+    """Resume a paused crawl in the current session."""
     try:
         return call("POST", "/api/resume_crawl")
     except Exception as e:
         return {"success": False, "error": str(e),
                 "note": "This endpoint may not be available in your LibreCrawl version."}
+
+
+@mcp.tool()
+def librecrawl_resume_from_crawl_id(crawl_id: int) -> dict:
+    """
+    Resume a previously interrupted crawl from the database — even from a NEW MCP session,
+    days later, after server restarts. Continues from where the crawl left off,
+    re-using all already-crawled URLs (no duplicate work, no extra load on the target).
+
+    This is the way to handle "however big, in chunks" without overloading the target:
+
+      Day 1: librecrawl_audit("https://huge-site.com", max_pages=5000)
+             — runs until time/limits or you pause it
+      Day 2: librecrawl_list_crawls() → find your crawl_id
+             librecrawl_resume_from_crawl_id(crawl_id)
+             — picks up where it left off, polite rate-limit intact
+
+    USE THIS when asked:
+    - "resume that crawl", "continue the audit from yesterday"
+    - "pick up where we left off", "finish the [site] crawl"
+
+    Args:
+        crawl_id: ID from librecrawl_list_crawls() of a paused/failed/interrupted crawl
+
+    Returns success + a `next` hint telling you to poll librecrawl_get_status()
+    until is_running=False, then call librecrawl_generate_report(crawl_id).
+    """
+    # Two scenarios to handle:
+    #
+    # (a) "In-session resume" — the crawl was paused in the same upstream Flask session
+    #     (e.g. paused 5 min ago, now resuming). The in-memory crawler is still alive
+    #     with is_running=True. /api/crawls/<id>/resume would reject this with
+    #     "Crawl already in progress". The right call is /api/resume_crawl, which
+    #     just flips is_paused=False on the existing crawler.
+    #
+    # (b) "Cross-session resume" — the upstream restarted (or the MCP's httpx.Client
+    #     was reset), so the crawler instance is gone but the DB record survives.
+    #     /api/crawls/<id>/resume reads from DB and rebuilds the crawler.
+    #
+    # We try (a) first because it's a no-op when wrong (returns 400 if nothing paused
+    # in memory) and safe when right. Then fall back to (b).
+    #
+    # NEVER calling /api/stop_crawl here — that would set DB status to 'stopped',
+    # which permanently blocks resume_from_database() for the same crawl_id.
+
+    # Attempt (a): in-session resume
+    try:
+        in_session = call("POST", "/api/resume_crawl")
+        if in_session.get("success"):
+            in_session["next"] = (
+                f"Poll librecrawl_get_status() until is_running=False, "
+                f"then librecrawl_generate_report({crawl_id})."
+            )
+            in_session["mode"] = "in_session_resume"
+            return in_session
+    except Exception:
+        pass  # fall through to DB resume
+
+    # Attempt (b): cross-session resume from DB
+    try:
+        result = call("POST", f"/api/crawls/{crawl_id}/resume")
+        if result.get("success"):
+            result["next"] = (
+                f"Poll librecrawl_get_status() until is_running=False, "
+                f"then librecrawl_generate_report({crawl_id})."
+            )
+            result["mode"] = "db_resume"
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e),
+                "hint": "Verify crawl_id with librecrawl_list_crawls(). "
+                        "Status must be paused/failed/running (not 'completed' or 'stopped')."}
 
 
 @mcp.tool()

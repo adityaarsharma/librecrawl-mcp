@@ -203,7 +203,7 @@ info "Step 4/5 — Installing LibreCrawl MCP server..."
 MCP_DIR="${INSTALL_DIR}/mcp-server"
 mkdir -p "${MCP_DIR}"
 
-# Download the full MCP server (19 tools) from the repo
+# Download the full MCP server (20 tools) from the repo
 info "Downloading MCP server (server.py)..."
 curl -fsSL "https://raw.githubusercontent.com/adityaarsharma/librecrawl-mcp/main/server.py" \
      -o "${MCP_DIR}/server.py" || err "Failed to download server.py from GitHub"
@@ -472,7 +472,7 @@ STUDIOJSON
   echo ""
 fi
 
-echo -e "  ${BOLD}19 tools available:${NC}"
+echo -e "  ${BOLD}20 tools available:${NC}"
 echo -e "    Crawl lifecycle  : librecrawl_start_crawl, librecrawl_get_status,"
 echo -e "                       librecrawl_export_results, librecrawl_list_crawls,"
 echo -e "                       librecrawl_stop_crawl, librecrawl_pause_crawl,"
