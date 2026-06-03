@@ -2399,6 +2399,109 @@ def librecrawl_schema_audit(urls: list, batch_size: int = 50, batch_delay: float
     }
 
 
+@mcp.tool()
+def librecrawl_schema_validate(crawl_id: int) -> dict:
+    """
+    NEW IN v1.5 — validate JSON-LD structured data against schema.org spec
+    AND Google Rich Results required fields.
+
+    The existing schema_check / _audit tools EXTRACT and classify schema
+    types. This tool goes further: for the 7 most common rich-result types
+    (Article, Product, Recipe, FAQPage, BreadcrumbList, Event, JobPosting,
+    VideoObject, HowTo) it checks that ALL required fields are present and
+    surfaces specific missing-field findings.
+
+    Output: writes <domain>-<ts>.schema-validation.csv alongside the report
+    with one row per finding (url, type, severity, check, detail).
+
+    USE THIS when asked:
+      - "validate schema markup", "are my schemas valid", "schema spec check"
+      - "rich result eligibility audit", "Google structured data validator"
+      - "find broken JSON-LD"
+
+    Args:
+        crawl_id: ID from librecrawl_list_crawls.
+
+    Returns:
+        summary + per-finding breakdown + path to schema-validation.csv.
+    """
+    import csv as csv_mod
+    from datetime import datetime
+    from pathlib import Path
+    from urllib.parse import urlparse
+    import schema_validator
+
+    try:
+        call("POST", f"/api/crawls/{crawl_id}/load")
+        r = get_client().post(f"{BASE}/api/export_data",
+                              json={"format": "json", "fields": EXPORT_FIELDS},
+                              timeout=300)
+        r.raise_for_status()
+        pages, _links = _parse_export(r.json())
+    except Exception as e:
+        return {"success": False, "error": f"Could not load crawl {crawl_id}: {e}"}
+
+    if not pages:
+        return {"success": False, "error": "No pages exported"}
+
+    # If structured_data isn't in the export, fetch each page's schemas live.
+    # Note: this is heavy. Cap at 50 pages to stay polite.
+    pages_with_inline_schema = sum(
+        1 for p in pages
+        if p.get("structured_data") or p.get("json_ld") or p.get("schema")
+    )
+    fetch_fallback_used = False
+    if pages_with_inline_schema == 0:
+        fetch_fallback_used = True
+        FETCH_CAP = 50
+        candidates = [p for p in pages
+                      if str(p.get("status_code", "")).startswith("2")][:FETCH_CAP]
+        for p in candidates:
+            url = p.get("url") or ""
+            if not url:
+                continue
+            try:
+                schemas = _extract_schema(url)
+                if schemas and not (len(schemas) == 1 and "error" in schemas[0]):
+                    p["structured_data"] = schemas
+            except Exception:
+                continue
+
+    summary = schema_validator.validate_crawl_schemas(pages)
+
+    # Derive domain + timestamp
+    base_url = ""
+    for p in pages:
+        u = p.get("url") or ""
+        if u:
+            pp = urlparse(u)
+            base_url = f"{pp.scheme}://{pp.netloc}"
+            break
+    domain = base_url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0] or "unknown"
+    ts = datetime.now().strftime("%Y%m%d-%H%M")
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = REPORTS_DIR / f"{domain}-{ts}.schema-validation.csv"
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv_mod.writer(f)
+        w.writerow(["url", "type", "severity", "check", "detail"])
+        for fi in summary["findings"]:
+            w.writerow([fi["url"], fi["type"], fi["severity"], fi["check"], fi["detail"]])
+
+    return {
+        "success":                True,
+        "crawl_id":               crawl_id,
+        "pages_total":            len(pages),
+        "pages_with_schema":      summary["pages_with_schema"],
+        "pages_with_errors":      summary["pages_with_errors"],
+        "total_findings":         summary["total_findings"],
+        "findings_by_check":      summary["findings_by_check"],
+        "schema_types_breakdown": summary["schema_types_breakdown"],
+        "schema_validation_csv":  str(csv_path),
+        "fetch_fallback_used":    fetch_fallback_used,
+    }
+
+
 # ── GSC section appender ──────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -2569,6 +2672,233 @@ def librecrawl_append_gsc_section(report_path: str, gsc_data: dict) -> dict:
         "coverage_errors": len(coverage),
         "crawl_errors": len(crawl_errors),
         "manual_actions": len(issues),
+    }
+
+
+# ── v1.5 GSC clicks integration ──────────────────────────────────────────────
+# Merge GSC search performance data INTO an existing crawl's per-page CSV
+# and emit winners/losers/quick-wins sidecars. We accept the GSC data as a
+# parameter so the orchestrator (Claude) can pull it via gsc-posi connector
+# and pass it here — no direct GSC API coupling inside this MCP.
+
+def _normalise_url_for_gsc_match(u: str) -> str:
+    """Canonicalise URL for GSC<->crawl matching. Strips scheme/www, lowercases
+    host, drops trailing slash, drops fragment + query."""
+    if not u:
+        return ""
+    from urllib.parse import urlparse
+    p = urlparse(u.strip())
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (p.path or "/").rstrip("/") or "/"
+    return f"{host}{path}"
+
+
+@mcp.tool()
+def librecrawl_merge_gsc_data(crawl_id: int, gsc_data: dict) -> dict:
+    """
+    NEW IN v1.5 — merge Google Search Console performance data into a crawl.
+
+    Augments the .per-page.csv with 5 new columns (clicks_28d, impressions_28d,
+    ctr_28d, position_28d, top_query) for every URL matched, and emits three
+    new sidecar CSVs alongside the report:
+
+      - <domain>-<ts>.gsc-winners.csv     top 50 by clicks
+      - <domain>-<ts>.gsc-losers.csv      top 50 high-impressions + low CTR
+      - <domain>-<ts>.gsc-quick-wins.csv  position 11-20 + impressions > 100
+
+    GSC data shape (accepts what gsc-posi / aditya-gsc returns):
+      {
+        "rows": [
+          {"url": "https://...", "clicks": N, "impressions": N,
+           "ctr": F, "position": F, "top_query": "..."},
+          ...
+        ]
+      }
+
+    URL matching is path-based: scheme + www + trailing slash are normalised
+    on both sides before joining.
+
+    USE THIS when asked:
+      - "merge GSC into the audit", "join clicks with crawl"
+      - "find quick-win pages", "winners and losers from GSC"
+
+    Args:
+        crawl_id:  Upstream LibreCrawl crawl ID.
+        gsc_data:  Dict with "rows" key as documented above.
+
+    Returns: summary + paths to all 4 written CSVs (augmented per-page + 3 new).
+    """
+    import csv as csv_mod
+    import os
+    from datetime import datetime
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    try:
+        call("POST", f"/api/crawls/{crawl_id}/load")
+        r = get_client().post(f"{BASE}/api/export_data",
+                              json={"format": "json", "fields": EXPORT_FIELDS},
+                              timeout=300)
+        r.raise_for_status()
+        pages, _links = _parse_export(r.json())
+    except Exception as e:
+        return {"success": False, "error": f"Could not load crawl {crawl_id}: {e}"}
+
+    if not pages:
+        return {"success": False, "error": "No pages in crawl"}
+
+    rows = gsc_data.get("rows") or []
+    if not isinstance(rows, list) or not rows:
+        return {"success": False, "error": "gsc_data.rows is empty or missing"}
+
+    # Build GSC index keyed on normalised path
+    gsc_by_path = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = row.get("url") or row.get("page") or ""
+        if not url:
+            continue
+        key = _normalise_url_for_gsc_match(url)
+        if not key:
+            continue
+        gsc_by_path[key] = {
+            "clicks":      int(row.get("clicks") or 0),
+            "impressions": int(row.get("impressions") or 0),
+            "ctr":         float(row.get("ctr") or 0.0),
+            "position":    float(row.get("position") or 0.0),
+            "top_query":   (row.get("top_query") or row.get("query") or "")[:280],
+        }
+
+    # Derive domain + timestamp from the first crawled URL
+    base_url = ""
+    for p in pages:
+        u = (p.get("url") or "").strip()
+        if u:
+            pp = urlparse(u)
+            base_url = f"{pp.scheme}://{pp.netloc}"
+            break
+    if not base_url:
+        return {"success": False, "error": "Cannot determine base URL from crawl"}
+
+    domain = base_url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+    ts = datetime.now().strftime("%Y%m%d-%H%M")
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Augmented per-page CSV with GSC columns
+    per_page_csv = REPORTS_DIR / f"{domain}-{ts}.per-page-with-gsc.csv"
+    check_cols = [name for name, _ in _PER_PAGE_CHECKS]
+    cols = ["url", "status_code", "depth", "word_count", "response_time_ms",
+            "title", "meta_description"] + check_cols + [
+        "failed_checks_count", "failed_checks_list",
+        "gsc_clicks_28d", "gsc_impressions_28d", "gsc_ctr_28d",
+        "gsc_position_28d", "gsc_top_query",
+    ]
+    matched_urls = 0
+    with open(per_page_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv_mod.writer(f)
+        w.writerow(cols)
+        for p in pages:
+            url = p.get("url", "")
+            key = _normalise_url_for_gsc_match(url)
+            gsc = gsc_by_path.get(key, {})
+            if gsc:
+                matched_urls += 1
+            failed = [name for name, pred in _PER_PAGE_CHECKS if _safe_pred(pred, p)]
+            checks_bits = [1 if name in failed else 0 for name in check_cols]
+            w.writerow([
+                url, p.get("status_code", ""), p.get("depth", ""),
+                p.get("word_count", ""), p.get("response_time_ms", ""),
+                (p.get("title") or "").replace("\n", " ")[:300],
+                (p.get("meta_description") or "").replace("\n", " ")[:500],
+                *checks_bits, len(failed), ";".join(failed),
+                gsc.get("clicks", ""), gsc.get("impressions", ""),
+                gsc.get("ctr", ""), gsc.get("position", ""),
+                gsc.get("top_query", ""),
+            ])
+
+    # 2. Winners — top 50 by clicks (matched URLs only)
+    winners = []
+    for p in pages:
+        key = _normalise_url_for_gsc_match(p.get("url", ""))
+        g = gsc_by_path.get(key)
+        if not g or g["clicks"] <= 0:
+            continue
+        winners.append({"url": p.get("url"), **g})
+    winners.sort(key=lambda x: -x["clicks"])
+    winners = winners[:50]
+
+    winners_csv = REPORTS_DIR / f"{domain}-{ts}.gsc-winners.csv"
+    with open(winners_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv_mod.writer(f)
+        w.writerow(["url", "clicks_28d", "impressions_28d", "ctr_28d",
+                    "position_28d", "top_query"])
+        for r in winners:
+            w.writerow([r["url"], r["clicks"], r["impressions"],
+                        r["ctr"], r["position"], r["top_query"]])
+
+    # 3. Losers — high impressions + low CTR (under 2%) — top 50
+    losers = []
+    for p in pages:
+        key = _normalise_url_for_gsc_match(p.get("url", ""))
+        g = gsc_by_path.get(key)
+        if not g or g["impressions"] < 100:
+            continue
+        if g["ctr"] >= 0.02:
+            continue
+        losers.append({"url": p.get("url"), **g})
+    losers.sort(key=lambda x: -x["impressions"])
+    losers = losers[:50]
+
+    losers_csv = REPORTS_DIR / f"{domain}-{ts}.gsc-losers.csv"
+    with open(losers_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv_mod.writer(f)
+        w.writerow(["url", "impressions_28d", "ctr_28d", "clicks_28d",
+                    "position_28d", "top_query"])
+        for r in losers:
+            w.writerow([r["url"], r["impressions"], r["ctr"], r["clicks"],
+                        r["position"], r["top_query"]])
+
+    # 4. Quick wins — position 11-20 + impressions > 100
+    quick_wins = []
+    for p in pages:
+        key = _normalise_url_for_gsc_match(p.get("url", ""))
+        g = gsc_by_path.get(key)
+        if not g:
+            continue
+        if not (11 <= g["position"] <= 20):
+            continue
+        if g["impressions"] <= 100:
+            continue
+        quick_wins.append({"url": p.get("url"), **g})
+    quick_wins.sort(key=lambda x: -x["impressions"])
+
+    quick_wins_csv = REPORTS_DIR / f"{domain}-{ts}.gsc-quick-wins.csv"
+    with open(quick_wins_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv_mod.writer(f)
+        w.writerow(["url", "position_28d", "impressions_28d", "clicks_28d",
+                    "ctr_28d", "top_query"])
+        for r in quick_wins:
+            w.writerow([r["url"], r["position"], r["impressions"],
+                        r["clicks"], r["ctr"], r["top_query"]])
+
+    return {
+        "success":             True,
+        "crawl_id":            crawl_id,
+        "base_url":            base_url,
+        "gsc_rows_provided":   len(rows),
+        "crawled_urls":        len(pages),
+        "matched_urls":        matched_urls,
+        "match_rate_pct":      round((matched_urls / max(1, len(pages))) * 100, 1),
+        "per_page_with_gsc_csv": str(per_page_csv),
+        "winners_csv":         str(winners_csv),
+        "winners_count":       len(winners),
+        "losers_csv":          str(losers_csv),
+        "losers_count":        len(losers),
+        "quick_wins_csv":      str(quick_wins_csv),
+        "quick_wins_count":    len(quick_wins),
     }
 
 
