@@ -3532,6 +3532,269 @@ def librecrawl_brain_purge_audit(crawl_id: int) -> dict:
         }
 
 
+# ── v1.9.0 Ephemeral mode ─────────────────────────────────────────────────────
+# The MCP wrapper retains zero memory of audited sites by default. After a
+# successful chunked audit, the client calls librecrawl_audit_zip to receive
+# all 7 artifacts as a single base64-encoded zip — then everything is wiped:
+# session row in state.db, all artifact files on disk, and the upstream
+# LibreCrawl crawl record. The local client becomes the only source of truth.
+
+# Upstream LibreCrawl's API doesn't expose DELETE /api/crawls/<id>, so we
+# delete rows directly from its SQLite. The `users.db` file holds users +
+# crawls + crawled_urls + crawl_links + crawl_issues. We touch the four
+# crawl tables only — never the users table.
+import sqlite3 as _sqlite3
+LIBRECRAWL_UPSTREAM_DB = Path(
+    os.getenv("LIBRECRAWL_UPSTREAM_DB",
+              "/home/posimyth-brain/webapps/librecrawl/data/users.db")
+)
+
+
+def _wipe_upstream_crawl_record(crawl_id: int) -> dict:
+    """Delete a single crawl_id's rows directly from upstream LibreCrawl's
+    sqlite. Returns row-counts per table. Best-effort — never raises.
+
+    Schema: crawls.id is PK; other tables key by crawl_id FK.
+    """
+    if crawl_id is None:
+        return {"skipped": "no crawl_id"}
+    if not LIBRECRAWL_UPSTREAM_DB.exists():
+        return {"skipped": f"upstream db not found at {LIBRECRAWL_UPSTREAM_DB}"}
+    counts = {}
+    try:
+        conn = _sqlite3.connect(str(LIBRECRAWL_UPSTREAM_DB), timeout=15.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        # FK-keyed tables first (preserve referential safety)
+        for table in ("crawl_issues", "crawl_links", "crawled_urls"):
+            try:
+                cur = conn.execute(f"DELETE FROM {table} WHERE crawl_id = ?", (crawl_id,))
+                counts[table] = cur.rowcount
+            except Exception as e:
+                counts[table] = f"error: {e}"
+        # crawls.id is the PK
+        try:
+            cur = conn.execute("DELETE FROM crawls WHERE id = ?", (crawl_id,))
+            counts["crawls"] = cur.rowcount
+        except Exception as e:
+            counts["crawls"] = f"error: {e}"
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        counts["error"] = str(e)
+    return counts
+
+
+def _wipe_all_upstream_crawls() -> dict:
+    """Truncate upstream LibreCrawl's crawl tables entirely. Returns counts."""
+    if not LIBRECRAWL_UPSTREAM_DB.exists():
+        return {"skipped": f"upstream db not found at {LIBRECRAWL_UPSTREAM_DB}"}
+    counts = {}
+    try:
+        conn = _sqlite3.connect(str(LIBRECRAWL_UPSTREAM_DB), timeout=15.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        for table in ("crawl_issues", "crawl_links", "crawled_urls", "crawls"):
+            try:
+                cur = conn.execute(f"DELETE FROM {table}")
+                counts[table] = cur.rowcount
+            except Exception as e:
+                counts[table] = f"error: {e}"
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        counts["error"] = str(e)
+    return counts
+
+@mcp.tool()
+def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
+    """
+    NEW IN v1.9.0 — Package every artifact from a finished audit into a single
+    zip, return it inline as base64, and (by default) immediately wipe all
+    server-side state for the session: SQLite rows, artifact files on disk,
+    and the upstream LibreCrawl crawl record.
+
+    USE THIS when you want the MCP to retain zero memory of the audited site —
+    the client downloads the zip, and the server forgets it ever happened.
+
+    Returns:
+      filename:      proposed download name (`<domain>-<ts>.zip`)
+      size_bytes:    uncompressed total / compressed zip size
+      file_count:    number of files inside the zip
+      sha256:        zip file integrity hash
+      content_base64: zip content, base64-encoded (decode with `base64 -d` or
+                      `base64.b64decode(...)`)
+      cleanup:       what was wiped: session_rows / files_deleted / upstream
+
+    Args:
+        session_id:    From librecrawl_start_chunked_audit().
+        auto_cleanup:  If True (default), nuke state.db rows + artifact files +
+                       upstream LibreCrawl crawl record after building the zip.
+                       Pass False ONLY if you want a "preview" download with
+                       data retained for inspection — then call again with
+                       True (or the wipe tool) to finalise the deletion.
+    """
+    import base64 as _b64
+    import hashlib as _hl
+    import io as _io
+    import zipfile as _zf
+    from pathlib import Path as _Path
+
+    s = _state.get_session(session_id)
+    if not s:
+        return {"success": False, "error": f"Unknown session_id: {session_id}"}
+    if s["status"] not in ("done",):
+        return {"success": False, "error": f"Audit not done — status is '{s['status']}'. "
+                "Wait for librecrawl_audit_status() to report done before zipping."}
+
+    arts = _state.list_artifacts(session_id)
+    if not arts:
+        return {"success": False, "error": "No artifacts registered for this session"}
+
+    # Build zip in memory
+    buf = _io.BytesIO()
+    files_added, missing = [], []
+    with _zf.ZipFile(buf, "w", compression=_zf.ZIP_DEFLATED, compresslevel=6) as zf:
+        # SUMMARY.txt at top — quick orientation for the client
+        url = s.get("url", "")
+        domain = url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+        summary_lines = [
+            "LibreCrawl MCP — Audit Bundle",
+            "By Aditya Sharma — github.com/adityaarsharma/librecrawl-mcp",
+            "",
+            f"Site:        {url}",
+            f"Session ID:  {session_id} (deleted on server after zip delivery)",
+            f"Upstream ID: {s.get('upstream_crawl_id')}",
+            f"Pages:       {s.get('pages_done')}",
+            f"Audit complete: {bool(s.get('audit_complete'))}",
+            f"Started:     {s.get('started_at')}",
+            f"Finished:    {s.get('finished_at')}",
+            "",
+            "Artifacts in this bundle:",
+        ]
+        for art in arts:
+            summary_lines.append(f"  - {art['kind']:25s}  {_Path(art['path']).name}")
+        zf.writestr("SUMMARY.txt", "\n".join(summary_lines) + "\n")
+
+        for art in arts:
+            src = _Path(art["path"])
+            if not src.exists():
+                missing.append(art["kind"])
+                continue
+            zf.write(src, arcname=src.name)
+            files_added.append({"kind": art["kind"], "name": src.name, "bytes": src.stat().st_size})
+
+    zip_bytes = buf.getvalue()
+    sha256 = _hl.sha256(zip_bytes).hexdigest()
+    filename = f"{domain}-{int(s.get('finished_at') or s.get('updated_at') or 0)}.zip"
+    content_b64 = _b64.b64encode(zip_bytes).decode("ascii")
+
+    cleanup = {"session_rows": None, "files_deleted": 0, "upstream": "skipped"}
+    if auto_cleanup:
+        # Wipe artifact files on disk
+        for art in arts:
+            try:
+                p = _Path(art["path"])
+                if p.exists():
+                    p.unlink()
+                    cleanup["files_deleted"] += 1
+            except Exception:
+                pass
+        # Wipe state DB rows for this session
+        try:
+            cleanup["session_rows"] = _state.delete_session(session_id)
+        except Exception as e:
+            cleanup["session_rows"] = f"error: {e}"
+        # Wipe upstream LibreCrawl crawl record. Try the REST DELETE first
+        # (in case upstream gets it added in future); fall back to direct
+        # sqlite row delete since current upstream doesn't expose the route.
+        upstream_id = s.get("upstream_crawl_id")
+        if upstream_id:
+            api_ok = False
+            try:
+                r = get_client().delete(f"{BASE}/api/crawls/{upstream_id}", timeout=15)
+                if r.status_code in (200, 204):
+                    cleanup["upstream"] = f"deleted upstream crawl {upstream_id} via REST"
+                    api_ok = True
+            except Exception:
+                pass
+            if not api_ok:
+                cleanup["upstream"] = _wipe_upstream_crawl_record(upstream_id)
+
+    return {
+        "success":         True,
+        "session_id":      session_id,
+        "filename":        filename,
+        "size_bytes":      len(zip_bytes),
+        "file_count":      len(files_added),
+        "files":           files_added,
+        "missing":         missing,
+        "sha256":          sha256,
+        "content_base64":  content_b64,
+        "cleanup":         cleanup,
+        "note":            "Server-side state wiped. This response IS your only copy — save the zip locally." if auto_cleanup else "auto_cleanup=False — call again with True (or librecrawl_wipe_everything) to actually wipe.",
+    }
+
+
+@mcp.tool()
+def librecrawl_wipe_everything(confirm: bool = False) -> dict:
+    """
+    NEW IN v1.9.0 — Nuke ALL audit data: every session row, every artifact
+    file in REPORTS_DIR, every LibreCrawl upstream crawl record. Use to
+    return the MCP to a zero-memory baseline.
+
+    REQUIRES confirm=True. Default refuses to fire.
+
+    Returns counts: sessions wiped, files deleted, upstream crawls deleted,
+    and bytes reclaimed on disk.
+    """
+    from pathlib import Path as _Path
+
+    if not confirm:
+        return {"success": False, "error": "Pass confirm=True to actually wipe. "
+                "This will delete ALL audit history — there is no undo."}
+
+    counts = {"sessions": 0, "files_deleted": 0, "bytes_reclaimed": 0,
+              "upstream_crawls_deleted": 0, "errors": []}
+
+    # 1. Wipe artifact files from REPORTS_DIR
+    if REPORTS_DIR.exists():
+        for f in REPORTS_DIR.iterdir():
+            if f.is_file():
+                try:
+                    sz = f.stat().st_size
+                    f.unlink()
+                    counts["files_deleted"] += 1
+                    counts["bytes_reclaimed"] += sz
+                except Exception as e:
+                    counts["errors"].append(f"unlink {f}: {e}")
+
+    # 2. Delete every session row + chunks/artifacts/events
+    try:
+        sessions = _state.list_all_sessions()
+        counts["sessions"] = len(sessions)
+        for sess in sessions:
+            try:
+                _state.delete_session(sess["id"])
+            except Exception as e:
+                counts["errors"].append(f"delete_session {sess['id']}: {e}")
+    except Exception as e:
+        counts["errors"].append(f"list_all_sessions: {e}")
+
+    # 3. Truncate upstream LibreCrawl crawl tables (direct sqlite — upstream
+    #    doesn't expose DELETE on its REST API).
+    try:
+        upstream = _wipe_all_upstream_crawls()
+        counts["upstream_crawls_deleted"] = upstream.get("crawls", 0) if isinstance(upstream.get("crawls"), int) else 0
+        counts["upstream_detail"] = upstream
+    except Exception as e:
+        counts["errors"].append(f"upstream wipe: {e}")
+
+    return {
+        "success":   True,
+        "wiped":     counts,
+        "note":      "MCP is now at zero-memory baseline. Future audits should call librecrawl_audit_zip with auto_cleanup=True to stay ephemeral.",
+    }
+
+
 if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "http")
     if transport == "stdio":

@@ -104,6 +104,44 @@ def init_db():
         conn.close()
 
 
+# ── Ephemeral-mode helpers (v1.9) ─────────────────────────────────────────────
+
+def delete_session(session_id: str) -> dict:
+    """Wipe ALL rows for a session — sessions / chunks / artifacts / events.
+
+    Returns row-counts deleted. Does NOT touch the artifact files on disk —
+    the caller is expected to unlink those separately (server.py does that
+    inside librecrawl_audit_zip after the zip has been built).
+    """
+    counts = {}
+    with _LOCK:
+        conn = _connect()
+        # FK tables use `session_id`; the sessions table uses `id` as PK.
+        for table in ("events", "artifacts", "chunks"):
+            cur = conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+            counts[table] = cur.rowcount
+        cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        counts["sessions"] = cur.rowcount
+        conn.close()
+    return counts
+
+
+def list_all_sessions() -> list:
+    """Every session row in the DB — used by wipe-everything tool."""
+    conn = _connect()
+    rows = conn.execute("SELECT * FROM sessions ORDER BY started_at").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_all_artifact_paths() -> list:
+    """All paths registered across all sessions — for bulk unlink."""
+    conn = _connect()
+    rows = conn.execute("SELECT path FROM artifacts").fetchall()
+    conn.close()
+    return [r["path"] for r in rows if r["path"]]
+
+
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
 def create_session(url, total_max_pages, chunk_target_pages, politeness, settings):
