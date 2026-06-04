@@ -111,6 +111,64 @@ JS_REDIRECT_RE = re.compile(
 ANCHOR_HREF_RE = re.compile(r'<a\s+[^>]*href\s*=\s*["\']#([^"\'\s]+)', re.IGNORECASE)
 ID_NAME_RE     = re.compile(r'\b(?:id|name)\s*=\s*["\']([^"\'\s]+)', re.IGNORECASE)
 
+# ── v1.8 Tier 2 patterns ──────────────────────────────────────────────────────
+
+# Image-tag attribute probes for performance / CLS / format checks.
+# These run over the page body once per page in _check_from_response.
+IMG_TAG_RE        = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+IMG_SRC_RE        = re.compile(r'\bsrc\s*=\s*["\']([^"\']+)', re.IGNORECASE)
+IMG_LOADING_RE    = re.compile(r'\bloading\s*=\s*["\']lazy', re.IGNORECASE)
+IMG_SRCSET_RE     = re.compile(r'\bsrcset\s*=', re.IGNORECASE)
+IMG_WIDTH_RE      = re.compile(r'\bwidth\s*=', re.IGNORECASE)
+IMG_HEIGHT_RE     = re.compile(r'\bheight\s*=', re.IGNORECASE)
+NEXT_GEN_FMT_EXT  = (".webp", ".avif")
+LEGACY_FMT_EXT    = (".jpg", ".jpeg", ".png", ".gif")
+
+# Iframe + favicon + DOM
+IFRAME_TAG_RE     = re.compile(r'<iframe\b[^>]*>', re.IGNORECASE)
+IFRAME_TITLE_RE   = re.compile(r'\btitle\s*=\s*["\']', re.IGNORECASE)
+LINK_TAG_RE       = re.compile(r'<link\b[^>]*>', re.IGNORECASE)
+HEAD_BLOCK_RE     = re.compile(r'<head\b[^>]*>(.*?)</head>', re.IGNORECASE | re.DOTALL)
+NOSCRIPT_IN_HEAD_RE = re.compile(r'<noscript\b', re.IGNORECASE)
+LINK_REL_RE       = re.compile(r'\brel\s*=\s*["\']([^"\']+)', re.IGNORECASE)
+LINK_HREF_RE      = re.compile(r'\bhref\s*=\s*["\']([^"\']+)', re.IGNORECASE)
+
+# Approx DOM-size probe: count tag-open characters in body.
+TAG_OPEN_RE       = re.compile(r'<[a-zA-Z][^>]*?>')
+DOM_SIZE_THRESHOLD = 1500          # > this many tag-opens → excessive
+HTML_OVER_2MB     = 2 * 1024 * 1024 # 2 MB — Google's parse limit
+
+# Canonical position probe — used to detect canonical_outside_head
+CANONICAL_LINK_RE = re.compile(
+    r'<link\b[^>]+rel\s*=\s*["\']canonical["\'][^>]*>',
+    re.IGNORECASE,
+)
+
+# Sitemap size + format checks
+SITEMAP_URL_HARD_LIMIT = 50_000   # Google's per-file URL cap
+SITEMAP_SIZE_HARD_LIMIT_BYTES = 50 * 1024 * 1024   # 50 MB uncompressed
+
+# Hreflang code validation. Approximation: ISO 639-1 (2-letter) optional
+# -Aa-Zz (script) optional -ZZ (region) or "x-default".
+VALID_HREFLANG_RE = re.compile(
+    r'^(?:x-default|[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|\d{3}))?)$',
+)
+
+# Localhost / private-IP outbound link detection
+LOCALHOST_HOST_RE = re.compile(
+    r'^(localhost|127\.0\.0\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    r'|192\.168\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3}'
+    r'|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?::\d+)?$',
+    re.IGNORECASE,
+)
+
+# Crawl-trap detection
+CALENDAR_FUTURE_YEAR_RE = re.compile(r'[?&](?:year|y|yr)=(\d{4})', re.IGNORECASE)
+SESSION_PARAM_NAMES = {
+    "phpsessid", "jsessionid", "aspsessionid", "sid", "sessionid",
+    "session_id", "sess_id", "ssid",
+}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -246,21 +304,41 @@ def _check_hreflang_returns(pages: list) -> list:
     return out
 
 
-# ── Canonical chain depth ─────────────────────────────────────────────────────
+# ── Canonical chain depth + canonical-target health ──────────────────────────
 
 def _check_canonical_chains(pages: list) -> list:
-    """Flag pages whose canonical points to another page that itself has a
-    different canonical (chain depth > 1)."""
-    canon_map = {}  # url -> canonical_url (both normalised)
+    """Flag canonical pathologies — depth, relative paths, points-to-redirect."""
+    canon_map = {}  # url -> canonical_url (both normalised, for chain detection)
+    status_by_url = {}  # normalised url -> status_code
     for p in pages or []:
         u = _normalise_for_match(p.get("url") or "")
-        c = _normalise_for_match(p.get("canonical_url") or "")
-        if u and c and u != c:
-            canon_map[u] = c
+        c_raw = (p.get("canonical_url") or "").strip()
+        c_norm = _normalise_for_match(c_raw)
+        if u:
+            status_by_url[u] = str(p.get("status_code", ""))
+        if u and c_norm and u != c_norm:
+            canon_map[u] = c_norm
 
     out = []
+    for p in pages or []:
+        u_raw = (p.get("url") or "").strip()
+        u = _normalise_for_match(u_raw)
+        c_raw = (p.get("canonical_url") or "").strip()
+        if not u or not c_raw:
+            continue
+        # canonical_to_relative: href without scheme is relative
+        if not urlparse(c_raw).scheme:
+            out.append((u_raw, "canonical_to_relative",
+                        f"Canonical uses relative path '{c_raw}' — should be absolute"))
+        # canonical_to_redirect: canonical target itself returns 3xx in our crawl
+        c_norm = _normalise_for_match(c_raw)
+        tgt_status = status_by_url.get(c_norm, "")
+        if tgt_status.startswith("3"):
+            out.append((u_raw, "canonical_to_redirect",
+                        f"Canonical {c_norm} returns {tgt_status} — link equity wasted"))
+
+    # canonical_chain_depth — chain hop
     for src, c1 in canon_map.items():
-        # Look up one hop
         c2 = canon_map.get(c1)
         if c2 and c2 != c1:
             out.append((src, "canonical_chain_depth",
@@ -268,18 +346,259 @@ def _check_canonical_chains(pages: list) -> list:
     return out
 
 
+# ── Hreflang full audit (v1.8) ────────────────────────────────────────────────
+
+def _check_hreflang_full(pages: list) -> list:
+    """Extends the v1.6 return-tag-only check with 6 more hreflang validations.
+
+    Required-field tables apply per Google docs:
+      https://developers.google.com/search/docs/specialty/international/localized-versions
+    """
+    # Build map first
+    page_by_norm = {_normalise_for_match(p.get("url") or ""): p for p in (pages or [])}
+    out = []
+    cluster_by_node = defaultdict(set)  # node URL -> set of hreflang targets (norm)
+
+    for p in pages or []:
+        u_raw = (p.get("url") or "").strip()
+        u = _normalise_for_match(u_raw)
+        if not u:
+            continue
+        hl = p.get("hreflang")
+        page_lang_attr = (p.get("lang") or "").strip().lower()
+
+        entries = []  # list of (lang_code, href_norm, href_raw)
+        if isinstance(hl, list):
+            for e in hl:
+                if isinstance(e, dict):
+                    lang = (e.get("hreflang") or e.get("lang") or "").strip()
+                    href = (e.get("href") or e.get("url") or "").strip()
+                    if href:
+                        entries.append((lang, _normalise_for_match(href), href))
+                elif isinstance(e, str) and "://" in e:
+                    entries.append(("", _normalise_for_match(e), e))
+        elif isinstance(hl, str):
+            for part in hl.split(","):
+                part = part.strip()
+                if "://" in part:
+                    href = part.split(":", 1)[1].strip() if ":" in part.split("://", 1)[0] else part
+                    entries.append(("", _normalise_for_match(href), href))
+
+        if not entries:
+            continue
+
+        langs = [e[0] for e in entries]
+        targets = {e[1] for e in entries}
+        cluster_by_node[u] |= targets
+
+        # hreflang_missing_self_reference: self-ref required per Google
+        if u not in targets:
+            out.append((u_raw, "hreflang_missing_self_reference",
+                        "Page in hreflang cluster but no self-referential hreflang"))
+        # hreflang_missing_x_default: cluster must have x-default fallback
+        if not any(l.lower() == "x-default" for l in langs):
+            out.append((u_raw, "hreflang_missing_x_default",
+                        "Hreflang cluster lacks x-default fallback"))
+        # hreflang_invalid_codes
+        for lang in langs:
+            if lang and not VALID_HREFLANG_RE.match(lang):
+                out.append((u_raw, "hreflang_invalid_codes",
+                            f"Invalid hreflang code: '{lang}' (expected ISO 639-1 / 3166-1)"))
+                break
+        # hreflang_conflicts_lang_attr: hreflang language disagrees with <html lang=>
+        if page_lang_attr:
+            page_lang_base = page_lang_attr.split("-")[0]
+            self_entry = next((e for e in entries if e[1] == u), None)
+            if self_entry and self_entry[0] and not self_entry[0].lower().startswith(page_lang_base):
+                out.append((u_raw, "hreflang_conflicts_lang_attr",
+                            f"hreflang='{self_entry[0]}' but <html lang='{page_lang_attr}'>"))
+        # hreflang_to_broken: target in crawl returned 4xx/5xx
+        for lang, tgt_norm, tgt_raw in entries:
+            tgt_page = page_by_norm.get(tgt_norm)
+            if tgt_page:
+                tsc = str(tgt_page.get("status_code", ""))
+                if tsc.startswith(("4", "5")):
+                    out.append((u_raw, "hreflang_to_broken",
+                                f"hreflang points to {tgt_raw} which returns {tsc}"))
+                # hreflang_to_noindex
+                if "noindex" in (tgt_page.get("robots") or "").lower():
+                    out.append((u_raw, "hreflang_to_noindex",
+                                f"hreflang points to {tgt_raw} which is noindex"))
+
+    return out
+
+
+# ── Internal nofollow patterns ─────────────────────────────────────────────────
+
+def _check_nofollow_patterns(links: list | None, pages: list) -> list:
+    """Detect three internal-nofollow anti-patterns:
+
+      internal_nofollow_outlinks  — page emits at least one nofollow internal link
+      nofollow_only_inbound        — page only RECEIVES nofollow internal links
+      follow_and_nofollow_mixed    — page receives both follow + nofollow internal
+                                      (confusing signal — Google may discount the page)
+    """
+    if not links:
+        return []
+    page_url_set = {_normalise_for_match(p.get("url") or "") for p in (pages or [])}
+    outbound_nofollow = defaultdict(int)   # source page → nofollow internal count
+    inbound_follow    = defaultdict(int)   # target page → follow internal count
+    inbound_nofollow  = defaultdict(int)   # target page → nofollow internal count
+
+    for lk in links:
+        if not isinstance(lk, dict):
+            continue
+        is_internal = lk.get("is_internal")
+        if isinstance(is_internal, str):
+            is_internal = is_internal.lower() in ("yes", "true", "1")
+        if not is_internal:
+            continue
+        src = _normalise_for_match(lk.get("source_url") or "")
+        tgt = _normalise_for_match(lk.get("target_url") or lk.get("url") or "")
+        rel = (lk.get("rel") or "").lower()
+        is_nofollow = "nofollow" in rel
+        if src in page_url_set:
+            if is_nofollow:
+                outbound_nofollow[src] += 1
+        if tgt in page_url_set:
+            if is_nofollow:
+                inbound_nofollow[tgt] += 1
+            else:
+                inbound_follow[tgt] += 1
+
+    out = []
+    for src, n in outbound_nofollow.items():
+        out.append((src, "internal_nofollow_outlinks",
+                    f"Page emits {n} nofollow internal link(s) — Google may discount these targets"))
+
+    for tgt in page_url_set:
+        nf = inbound_nofollow.get(tgt, 0)
+        fo = inbound_follow.get(tgt, 0)
+        if nf > 0 and fo > 0:
+            out.append((tgt, "follow_and_nofollow_mixed",
+                        f"Page receives both follow ({fo}) and nofollow ({nf}) internal links — mixed signal"))
+        elif nf > 0 and fo == 0:
+            out.append((tgt, "nofollow_only_inbound",
+                        f"Page receives only nofollow ({nf}) internal links — likely won't get indexed"))
+    return out
+
+
+def _check_anchor_image_no_alt(links: list | None) -> list:
+    """anchor_image_no_alt: <a><img></a> where img has no alt and the anchor
+    has no other text — Google sees an empty-anchor link."""
+    if not links:
+        return []
+    out = []
+    for lk in links:
+        if not isinstance(lk, dict):
+            continue
+        anchor = (lk.get("anchor_text") or lk.get("anchor") or "").strip()
+        # Heuristic: empty/whitespace anchor + the source link came from an img.
+        # Flat links list doesn't include the inner-HTML detail, so this is
+        # best-effort: anchor empty + anchor contains-only-whitespace or
+        # was tagged "image" by upstream. Conservative: only flag when anchor
+        # is completely empty AND link has no rel attribute (real links almost
+        # always have anchor text or rel).
+        if anchor == "" and not (lk.get("rel") or ""):
+            src = (lk.get("source_url") or "").strip()
+            tgt = (lk.get("target_url") or lk.get("url") or "").strip()
+            if src and tgt:
+                out.append((src, "anchor_image_no_alt",
+                            f"Empty-anchor link to {tgt} (likely <a><img></a> with no alt)"))
+    return out
+
+
+# ── Crawl-trap detection ──────────────────────────────────────────────────────
+
+def _check_crawl_traps(pages: list) -> list:
+    """Detect three crawl-budget killers:
+
+      spider_trap_calendar       — URLs with future-year params (calendar widget trap)
+      url_session_id_high_entropy — URLs carrying session-id params (PHPSESSID, etc.)
+      faceted_url_explosion      — URL-param cluster: same path + >3 different
+                                    parameter combinations (filter explosion)
+    """
+    from datetime import datetime
+    this_year = datetime.now().year
+    out = []
+    path_param_clusters = defaultdict(set)  # path -> set of param signatures
+
+    for p in pages or []:
+        url = (p.get("url") or "").strip()
+        if not url:
+            continue
+        parsed = urlparse(url)
+
+        # spider_trap_calendar: future year in query
+        for m in CALENDAR_FUTURE_YEAR_RE.finditer(url):
+            try:
+                yr = int(m.group(1))
+                if yr > this_year + 2:
+                    out.append((url, "spider_trap_calendar",
+                                f"Calendar URL points to future year {yr}"))
+                    break
+            except ValueError:
+                pass
+
+        # url_session_id_high_entropy
+        query_keys = {k.split("=")[0].lower() for k in parsed.query.split("&") if k}
+        sess_hits = query_keys & SESSION_PARAM_NAMES
+        if sess_hits:
+            out.append((url, "url_session_id_high_entropy",
+                        f"Session-id param in URL: {', '.join(sess_hits)}"))
+
+        # faceted_url_explosion — bucket by path, track distinct query signatures
+        if parsed.query:
+            sig = tuple(sorted(k.split("=", 1)[0].lower() for k in parsed.query.split("&") if k))
+            path_param_clusters[parsed.path].add(sig)
+
+    # Flag paths with > 3 distinct parameter signatures (rough threshold)
+    for path, sigs in path_param_clusters.items():
+        if len(sigs) > 3:
+            out.append((path, "faceted_url_explosion",
+                        f"Path {path} has {len(sigs)} distinct query-parameter combinations"))
+    return out
+
+
+def _check_localhost_outlinks(links: list | None) -> list:
+    """outlinks_to_localhost — flag any outbound link with localhost / private IP host."""
+    if not links:
+        return []
+    out = []
+    seen = set()
+    for lk in links:
+        if not isinstance(lk, dict):
+            continue
+        tgt = (lk.get("target_url") or lk.get("url") or "").strip()
+        if not tgt:
+            continue
+        host = (urlparse(tgt).hostname or "")
+        if host and LOCALHOST_HOST_RE.match(host):
+            key = (lk.get("source_url"), tgt)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((lk.get("source_url", ""), "outlinks_to_localhost",
+                        f"Page links to localhost/private-IP host: {tgt}"))
+    return out
+
+
 # ── Sitemap cross-checks (fetch sitemap, intersect with crawl) ───────────────
 
-def _fetch_sitemap_urls(sitemap_url: str, timeout_s: float = 10.0) -> list:
-    """Best-effort fetch of sitemap.xml. Returns list of URLs found."""
+def _fetch_sitemap_urls(sitemap_url: str, timeout_s: float = 10.0) -> tuple:
+    """Best-effort fetch of sitemap.xml. Returns (urls_list, size_bytes).
+
+    v1.8: also returns the raw fetched-size so size-based checks can fire.
+    """
     try:
         r = httpx.get(sitemap_url, timeout=timeout_s, follow_redirects=True,
                       headers={"User-Agent": "LibreCrawl-MCP/1.5"})
         if r.status_code >= 400:
-            return []
+            return [], 0
+        size_bytes = len(r.content)
         root = ET.fromstring(r.content)
     except Exception:
-        return []
+        return [], 0
 
     # Strip XML namespace - sitemap.xml uses sitemaps.org/schemas/sitemap/0.9
     def _local(tag):
@@ -290,7 +609,7 @@ def _fetch_sitemap_urls(sitemap_url: str, timeout_s: float = 10.0) -> list:
     for el in root.iter():
         if _local(el.tag) == "loc":
             urls.append((el.text or "").strip())
-    return urls
+    return urls, size_bytes
 
 
 def _fetch_robots_disallow(base_url: str, timeout_s: float = 10.0) -> list:
@@ -324,9 +643,13 @@ def _fetch_robots_disallow(base_url: str, timeout_s: float = 10.0) -> list:
 
 
 def _check_sitemap_crosschecks(pages: list, base_url: str) -> list:
-    """Cross-check sitemap URLs against the crawl's known statuses + noindex."""
+    """Cross-check sitemap URLs against the crawl's known statuses + noindex.
+
+    v1.8: also flags sitemap-spec violations — over 50k URLs, over 50 MB,
+    URLs that canonicalise away (sitemap shouldn't list non-canonical pages).
+    """
     sitemap_url = f"{base_url.rstrip('/')}/sitemap.xml"
-    sitemap_urls = _fetch_sitemap_urls(sitemap_url)
+    sitemap_urls, size_bytes = _fetch_sitemap_urls(sitemap_url)
     if not sitemap_urls:
         return []
 
@@ -336,6 +659,14 @@ def _check_sitemap_crosschecks(pages: list, base_url: str) -> list:
 
     out = []
     sitemap_norm = [_normalise_for_match(u) for u in sitemap_urls]
+
+    # v1.8 sitemap-spec checks (Google's per-file limits)
+    if len(sitemap_urls) > SITEMAP_URL_HARD_LIMIT:
+        out.append((sitemap_url, "sitemap_over_50k_urls",
+                    f"Sitemap contains {len(sitemap_urls)} URLs (Google cap: 50,000)"))
+    if size_bytes > SITEMAP_SIZE_HARD_LIMIT_BYTES:
+        out.append((sitemap_url, "sitemap_over_50mb",
+                    f"Sitemap is {size_bytes/1024/1024:.1f} MB uncompressed (Google cap: 50 MB)"))
 
     for orig_url, norm_url in zip(sitemap_urls, sitemap_norm):
         page = page_by_url.get(norm_url)
@@ -362,6 +693,12 @@ def _check_sitemap_crosschecks(pages: list, base_url: str) -> list:
         if sc.startswith("3"):
             out.append((orig_url, "sitemap_url_3xx",
                         f"URL in sitemap but returns {sc}"))
+
+        # canonicalised away?  v1.8 — sitemap should list canonical URLs only.
+        canon = _normalise_for_match(page.get("canonical_url") or "")
+        if canon and canon != norm_url:
+            out.append((orig_url, "sitemap_contains_canonicalized",
+                        f"URL in sitemap canonicalises to {canon} — sitemap should list canonical only"))
 
     return out
 
@@ -505,6 +842,141 @@ def _check_from_response(url: str, resp, status: int, headers: dict,
                     f"{', '.join('#' + b for b in broken[:5])}",
                 ))
 
+    # ── v1.8 Tier 2 HTML-response-layer checks ──────────────────────────────
+    if body and 200 <= status < 300:
+        body_bytes = len(body.encode("utf-8", errors="ignore"))
+
+        # html_over_2mb — Google's parse-size limit
+        if body_bytes > HTML_OVER_2MB:
+            findings.append((
+                "html_over_2mb",
+                f"HTML body {body_bytes/1024/1024:.1f} MB > Google's 2 MB parse limit",
+            ))
+
+        # dom_size_excessive — approximation via tag-open count
+        tag_count = len(TAG_OPEN_RE.findall(body))
+        if tag_count > DOM_SIZE_THRESHOLD:
+            findings.append((
+                "dom_size_excessive",
+                f"~{tag_count} DOM nodes (> {DOM_SIZE_THRESHOLD}) — affects PageSpeed",
+            ))
+
+        # ── <head> block analysis ──
+        head_match = HEAD_BLOCK_RE.search(body)
+        head_block = head_match.group(1) if head_match else ""
+
+        # noscript_in_head — invalid HTML structure (some parsers stop parsing)
+        if head_block and NOSCRIPT_IN_HEAD_RE.search(head_block):
+            findings.append((
+                "noscript_in_head",
+                "<noscript> tag inside <head> — invalid HTML5, can break parsers",
+            ))
+
+        # missing_favicon — neither <link rel="icon"> nor <link rel="shortcut icon"></link>
+        # Guard on head_match (truthy when <head> exists) not head_block (which is
+        # empty-string-falsy for <head></head>). Empty head ⇒ no favicon ⇒ missing.
+        if head_match:
+            has_favicon = False
+            for link_tag in LINK_TAG_RE.findall(head_block):
+                rel_m = LINK_REL_RE.search(link_tag)
+                if rel_m:
+                    rel = rel_m.group(1).lower()
+                    if "icon" in rel:   # matches "icon", "shortcut icon", "apple-touch-icon"
+                        has_favicon = True
+                        break
+            if not has_favicon:
+                findings.append((
+                    "missing_favicon",
+                    "No <link rel=\"icon\"> (or shortcut/apple-touch-icon) in <head>",
+                ))
+
+        # canonical_outside_head — <link rel=canonical> found outside <head>
+        body_minus_head = body
+        if head_match:
+            body_minus_head = body[:head_match.start()] + body[head_match.end():]
+        canon_in_body = CANONICAL_LINK_RE.search(body_minus_head)
+        if canon_in_body and head_block and not CANONICAL_LINK_RE.search(head_block):
+            findings.append((
+                "canonical_outside_head",
+                "<link rel=canonical> found in <body>, not <head>",
+            ))
+
+        # broken_or_invalid_html — pragmatic heuristic: missing required tags
+        # or mismatched open/close counts on common containers.
+        html_open = body.lower().count("<html")
+        html_close = body.lower().count("</html>")
+        body_open = body.lower().count("<body")
+        body_close = body.lower().count("</body>")
+        if html_open == 0 or body_open == 0:
+            findings.append((
+                "broken_or_invalid_html",
+                f"Missing <html> ({html_open}) or <body> ({body_open}) tag",
+            ))
+        elif html_close == 0 or body_close == 0:
+            findings.append((
+                "broken_or_invalid_html",
+                f"Unclosed <html> or <body> (open={html_open}/{body_open}, "
+                f"close={html_close}/{body_close})",
+            ))
+
+        # ── Image checks (loop over all <img> tags in body) ──
+        no_lazy = 0
+        no_srcset = 0
+        no_dims = 0
+        legacy_fmt = 0
+        for img_tag in IMG_TAG_RE.findall(body):
+            if not IMG_LOADING_RE.search(img_tag):
+                no_lazy += 1
+            if not IMG_SRCSET_RE.search(img_tag):
+                no_srcset += 1
+            if not (IMG_WIDTH_RE.search(img_tag) and IMG_HEIGHT_RE.search(img_tag)):
+                no_dims += 1
+            src_m = IMG_SRC_RE.search(img_tag)
+            if src_m:
+                src_low = src_m.group(1).lower().split("?", 1)[0]
+                if src_low.endswith(LEGACY_FMT_EXT):
+                    legacy_fmt += 1
+        # Only flag if 3+ images on the page show the issue — single-image
+        # decoration shouldn't dominate the checks_manifest.
+        if no_lazy >= 3:
+            findings.append((
+                "lazy_load_attr_missing",
+                f"{no_lazy} <img> tags missing loading=\"lazy\"",
+            ))
+        if no_srcset >= 3:
+            findings.append((
+                "srcset_missing",
+                f"{no_srcset} <img> tags missing srcset (responsive delivery)",
+            ))
+        if no_dims >= 3:
+            findings.append((
+                "image_dimensions_missing",
+                f"{no_dims} <img> tags missing width/height — CLS risk",
+            ))
+        if legacy_fmt >= 3:
+            findings.append((
+                "next_gen_image_format",
+                f"{legacy_fmt} <img> tags using PNG/JPG/GIF — consider WebP/AVIF",
+            ))
+
+        # ── Iframes ──
+        iframe_count = 0
+        iframe_no_title = 0
+        for iframe_tag in IFRAME_TAG_RE.findall(body):
+            iframe_count += 1
+            if not IFRAME_TITLE_RE.search(iframe_tag):
+                iframe_no_title += 1
+        if iframe_count > 0:
+            findings.append((
+                "iframes_present",
+                f"{iframe_count} iframe(s) on page",
+            ))
+        if iframe_no_title > 0:
+            findings.append((
+                "iframe_missing_title",
+                f"{iframe_no_title} iframe(s) missing title attribute — accessibility",
+            ))
+
     return findings
 
 
@@ -544,20 +1016,35 @@ def run_extended_checks(pages: list, base_url: str, output_path: Path,
     for src, check, detail in _check_anchor_quality(links):
         findings.append((src, check, "low", detail))
 
-    # 3. Hreflang return-tag check (graph-only, no fetch)
-    for src, check, detail in _check_hreflang_returns(pages or []):
+    # 3. Hreflang full audit (v1.8 — return tag + self-ref + x-default +
+    #     invalid codes + to-noindex + to-broken + conflicts with html lang)
+    for src, check, detail in _check_hreflang_full(pages or []):
         findings.append((src, check, "medium", detail))
 
-    # 4. Canonical chain check (graph-only, no fetch)
+    # 4. Canonical chain + canonical-target health (v1.8 added)
     for src, check, detail in _check_canonical_chains(pages or []):
         findings.append((src, check, "medium", detail))
 
-    # 5. Sitemap cross-checks (sitemap fetch + robots.txt fetch)
+    # 5. Sitemap cross-checks (sitemap fetch + robots.txt fetch + v1.8 spec limits)
     try:
         for src, check, detail in _check_sitemap_crosschecks(pages or [], base_url):
             findings.append((src, check, "high", detail))
     except Exception:
         pass
+
+    # 5b. Internal nofollow patterns + anchor-image (v1.8 — graph-only, no fetch)
+    for src, check, detail in _check_nofollow_patterns(links, pages or []):
+        findings.append((src, check, "medium", detail))
+    for src, check, detail in _check_anchor_image_no_alt(links):
+        findings.append((src, check, "low", detail))
+
+    # 5c. Crawl-trap detection (v1.8 — URL-pattern-only, no fetch)
+    for src, check, detail in _check_crawl_traps(pages or []):
+        findings.append((src, check, "high", detail))
+
+    # 5d. Localhost / private-IP outlinks (v1.8 — dev leak)
+    for src, check, detail in _check_localhost_outlinks(links):
+        findings.append((src, check, "high", detail))
 
     # 6. Response-level checks (security headers, soft-404, mixed content)
     candidates = []
@@ -594,15 +1081,19 @@ def run_extended_checks(pages: list, base_url: str, output_path: Path,
                 body = ""
             for check, detail in _check_from_response(url, resp, status, headers, body):
                 # Severity tiering. high = audit data suspect or page broken;
-                # medium = real-issue surface; low = stylistic.
+                # medium = real-issue surface; low = stylistic / count-based.
                 if check in ("soft_404", "mixed_content",
-                             "bot_block_challenge_detected"):
+                             "bot_block_challenge_detected",
+                             "broken_or_invalid_html", "html_over_2mb"):
                     sev = "high"
                 elif check in ("meta_refresh_redirect", "js_redirect",
-                               "http_refresh_redirect", "broken_bookmarks"):
+                               "http_refresh_redirect", "broken_bookmarks",
+                               "canonical_outside_head", "noscript_in_head",
+                               "dom_size_excessive", "image_dimensions_missing",
+                               "iframe_missing_title"):
                     sev = "medium"
                 else:
-                    sev = "medium"
+                    sev = "low"
                 findings.append((url, check, sev, detail))
 
     # Write CSV
