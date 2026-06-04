@@ -18,7 +18,79 @@ from urllib.parse import urlparse, unquote
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("librecrawl-mcp")
+# v2.0.3 — server instructions are surfaced to the LLM at connection time by
+# every MCP-compatible client. This means the rules below apply even when the
+# operator does NOT have the local Claude Code skill installed — any client
+# connecting to brain.posimyth.com/librecrawl/mcp gets the same contract.
+LIBRECRAWL_MCP_INSTRUCTIONS = """\
+You are driving librecrawl-mcp — a self-hosted SEO audit MCP server. Read
+these rules before invoking any tool. They are MANDATORY.
+
+# How to run an audit
+
+1. librecrawl_start_chunked_audit(url, total_max_pages=10000, ...)
+   → returns session_id immediately. Use this for every audit.
+   Do NOT use the legacy librecrawl_audit() — it blocks for up to 2 hours
+   and disconnects the MCP client on big sites.
+
+2. librecrawl_audit_status(session_id)
+   → poll every 20-30 seconds until status="done". Safe to poll often,
+   it reads local SQLite, no upstream calls.
+
+3. librecrawl_audit_zip(session_id, auto_cleanup=True)
+   → ALWAYS auto_cleanup=True. This is the default and the only sane
+   choice. The server wipes the session + artifacts + upstream record
+   the moment this call returns.
+
+# MANDATORY rules for handling the zip response
+
+Rule 1 — SAVE THE ZIP LOCALLY, IMMEDIATELY.
+The response includes `content_base64`. You MUST base64-decode it and
+write the bytes to a LOCAL file on the operator's machine. Use the
+response's `filename` field as the local filename. Pseudo-code your
+runtime must execute right after receiving the response:
+
+    import base64
+    local_path = response["filename"]
+    with open(local_path, "wb") as f:
+        f.write(base64.b64decode(response["content_base64"]))
+
+Rule 2 — NEVER report `zip_path` as the deliverable.
+The `zip_path` field in the response is on the REMOTE server. The
+operator cannot open it. It's there for forensics only. Report ONLY
+the LOCAL path you just saved to in your reply to the user.
+
+Rule 3 — auto_cleanup=True is mandatory.
+The server is ephemeral by design. Do not set auto_cleanup=False to
+"preserve data" — the base64 zip you just received IS the preserved
+data. Skipping auto_cleanup leaves audit data on the server, which
+violates the operator's stated privacy contract.
+
+# What the audit produces
+
+A single zip with 8 files:
+  - SUMMARY.txt — orientation
+  - <domain>-<ts>.pdf — branded human-readable report (PDF)
+  - <domain>-<ts>.md  — Markdown source
+  - <domain>-<ts>.per-page.csv — one row per crawled URL × 30 columns
+  - <domain>-<ts>.sitemap-recon.csv — sitemap drift table
+  - <domain>-<ts>.external-links.csv — every outbound URL HEAD-validated
+  - <domain>-<ts>.content-audit.csv — readability, AI-tells, punctuation
+  - <domain>-<ts>.extended-checks.csv — 50+ technical SEO findings
+
+The PDF report surfaces the Summary scorecard (with external-link counts),
+a Critical section with broken pages + broken external links + duplicate
+titles, and dedicated H2 sections for redirects, hreflang, schema, etc.
+
+# Final response shape to the user
+
+✅ Audit complete.
+Saved locally: ./<domain>-<ts>.zip (XXX KB · sha256 verified)
+Contents: PDF report + 7 CSVs.
+Server forgot the session — nothing remote.
+"""
+
+mcp = FastMCP("librecrawl-mcp", instructions=LIBRECRAWL_MCP_INSTRUCTIONS)
 
 BASE            = f"http://127.0.0.1:{os.getenv('LIBRECRAWL_PORT', '5080')}"
 MCP_PORT        = int(os.getenv('MCP_PORT', '5081'))
@@ -3649,30 +3721,35 @@ def _wipe_all_upstream_crawls() -> dict:
 @mcp.tool()
 def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
     """
-    NEW IN v1.9.0 — Package every artifact from a finished audit into a single
-    zip, return it inline as base64, and (by default) immediately wipe all
-    server-side state for the session: SQLite rows, artifact files on disk,
-    and the upstream LibreCrawl crawl record.
+    Download the finished audit as a zip + ephemeral cleanup. v2.0.3.
 
-    USE THIS when you want the MCP to retain zero memory of the audited site —
-    the client downloads the zip, and the server forgets it ever happened.
-
-    Returns:
-      filename:      proposed download name (`<domain>-<ts>.zip`)
-      size_bytes:    uncompressed total / compressed zip size
-      file_count:    number of files inside the zip
-      sha256:        zip file integrity hash
-      content_base64: zip content, base64-encoded (decode with `base64 -d` or
-                      `base64.b64decode(...)`)
-      cleanup:       what was wiped: session_rows / files_deleted / upstream
+    ⚠️ MANDATORY for the calling agent:
+      1. base64-decode `content_base64` and write to a LOCAL file using the
+         response's `filename` field. Do this IMMEDIATELY before reporting
+         back to the user.
+      2. Report the LOCAL path you saved to. NEVER report `zip_path` — that
+         path is on the REMOTE server and the operator cannot open it.
+      3. Always call with auto_cleanup=True (the default). The base64 in
+         the response IS the preserved copy; auto_cleanup=False just leaves
+         duplicate data on the server.
 
     Args:
-        session_id:    From librecrawl_start_chunked_audit().
-        auto_cleanup:  If True (default), nuke state.db rows + artifact files +
-                       upstream LibreCrawl crawl record after building the zip.
-                       Pass False ONLY if you want a "preview" download with
-                       data retained for inspection — then call again with
-                       True (or the wipe tool) to finalise the deletion.
+        session_id:    From librecrawl_start_chunked_audit() once status=done.
+        auto_cleanup:  True (default + recommended). Wipes session row +
+                       artifact files + upstream LibreCrawl crawl record
+                       atomically with the response. False is a discouraged
+                       preview-only mode that leaves data on the server —
+                       avoid unless you have a specific reason and intend
+                       to call librecrawl_wipe_everything() to clean up.
+
+    Returns:
+      filename:                 e.g. "<domain>-<unix-ts>.zip"
+      save_to_local_filename:   echoes filename — save the base64 here
+      size_bytes / file_count / sha256: integrity metadata
+      content_base64:           zip content, base64-encoded (decode + save locally)
+      zip_path / zip_path_is_remote: REMOTE server path, not for client use
+      cleanup:                  what was wiped server-side
+      note:                     embedded usage reminder for the calling agent
     """
     import base64 as _b64
     import hashlib as _hl
