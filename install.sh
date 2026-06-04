@@ -198,22 +198,58 @@ for i in $(seq 1 18); do
 done
 
 # ── Step 4: MCP server ───────────────────────────────────────────────────────
-info "Step 4/5 — Installing LibreCrawl MCP server..."
+info "Step 4/5 — Installing LibreCrawl MCP server (v2.0.3 — 37 tools)..."
 
 MCP_DIR="${INSTALL_DIR}/mcp-server"
 mkdir -p "${MCP_DIR}"
 
-# Download the full MCP server (24 tools) from the repo
-info "Downloading MCP server (server.py)..."
-curl -fsSL "https://raw.githubusercontent.com/adityaarsharma/librecrawl-mcp/main/server.py" \
-     -o "${MCP_DIR}/server.py" || err "Failed to download server.py from GitHub"
-log "MCP server downloaded"
+# Download all 10 Python modules that make up the v2.0.3 MCP wrapper.
+# server.py is the FastMCP entrypoint; the others are imported by it.
+# Server-side instructions + ephemeral mode + 37 tools all need these files.
+info "Downloading MCP server modules from GitHub (10 files)..."
+BASE_URL="https://raw.githubusercontent.com/adityaarsharma/librecrawl-mcp/main"
+for f in server.py state.py libreclient.py runner.py external_links.py \
+         content_audit.py extended_checks.py schema_validator.py \
+         sitemap_fill.py pdf_report.py; do
+  curl -fsSL "${BASE_URL}/${f}" -o "${MCP_DIR}/${f}" \
+       || err "Failed to download ${f} from GitHub"
+done
+log "10 Python modules downloaded"
+
+# Optional: drop the Claude Code skill into ~/.claude/skills/ for clients
+# that pick it up (Claude Code does — server-side `instructions` covers
+# the rest, so this is a developer-experience convenience, not required
+# for correctness).
+SKILL_DIR="${HOME}/.claude/skills/librecrawl-audit"
+mkdir -p "${SKILL_DIR}"
+curl -fsSL "${BASE_URL}/.claude/skills/librecrawl-audit/SKILL.md" \
+     -o "${SKILL_DIR}/SKILL.md" 2>/dev/null \
+     && log "Claude Code skill installed at ${SKILL_DIR}/" \
+     || info "(Optional skill download skipped — server-side instructions still apply.)"
 
 # Create venv and install deps
 info "Creating Python venv and installing dependencies..."
 python3 -m venv "${MCP_DIR}/venv"
 "${MCP_DIR}/venv/bin/pip" install --quiet --upgrade pip
-"${MCP_DIR}/venv/bin/pip" install --quiet "mcp>=1.0.0" httpx uvicorn
+# Core MCP + HTTP + report stack:
+#   mcp + httpx + uvicorn — FastMCP server runtime
+#   weasyprint + markdown — PDF rendering pipeline (.pdf sidecar)
+"${MCP_DIR}/venv/bin/pip" install --quiet \
+    "mcp>=1.0.0" httpx uvicorn weasyprint markdown
+
+# WeasyPrint needs Pango/Cairo system libraries to render PDFs. We install
+# them via apt non-interactively. If the user is not on Debian/Ubuntu OR
+# doesn't have passwordless sudo, the install still completes but
+# WeasyPrint will throw at first PDF render — the surrounding try/except
+# in runner.py logs the failure without failing the whole audit.
+if command -v apt-get &>/dev/null && sudo -n true 2>/dev/null; then
+  info "Installing WeasyPrint system deps (libpango/libcairo/libharfbuzz)..."
+  sudo apt-get install -y -q \
+    libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
+    libcairo2 libcairo-gobject2 2>/dev/null \
+    && log "System deps installed" \
+    || info "(System deps install skipped — PDF rendering may not work; install manually if needed.)"
+fi
 
 log "Python dependencies installed"
 
@@ -472,25 +508,33 @@ STUDIOJSON
   echo ""
 fi
 
-echo -e "  ${BOLD}24 tools available (v1.2.0):${NC}"
-echo -e "    Strict audits    : librecrawl_full_audit_strict (no silent caps),"
-echo -e "                       librecrawl_audit, librecrawl_site_check"
+echo -e "  ${BOLD}37 tools available (v2.0.3):${NC}"
+echo -e "    Chunked audit    : librecrawl_start_chunked_audit (USE THIS),"
+echo -e "                       librecrawl_audit_status, librecrawl_audit_zip,"
+echo -e "                       librecrawl_audit_artifacts,"
+echo -e "                       librecrawl_audit_pause, _resume, _cancel,"
+echo -e "                       librecrawl_audit_force_advance"
+echo -e "    Ephemeral mode   : librecrawl_audit_zip (auto_cleanup=True),"
+echo -e "                       librecrawl_wipe_everything"
+echo -e "    External links   : librecrawl_external_links_audit"
+echo -e "    Schema           : librecrawl_schema_validate, librecrawl_schema_check,"
+echo -e "                       librecrawl_schema_audit"
+echo -e "    PageSpeed        : librecrawl_pagespeed, librecrawl_pagespeed_audit,"
+echo -e "                       librecrawl_pagespeed_audit_all_crawl_pages"
+echo -e "    GSC merge        : librecrawl_merge_gsc_data, librecrawl_append_gsc_section"
+echo -e "    Reports          : librecrawl_audit_pdf, librecrawl_report_content,"
+echo -e "                       librecrawl_generate_report"
 echo -e "    Crawl lifecycle  : librecrawl_start_crawl, librecrawl_get_status,"
 echo -e "                       librecrawl_export_results, librecrawl_list_crawls,"
 echo -e "                       librecrawl_stop_crawl, librecrawl_pause_crawl,"
-echo -e "                       librecrawl_resume_crawl, librecrawl_resume_from_crawl_id,"
-echo -e "                       librecrawl_brain_purge_audit"
-echo -e "    Site analysis    : librecrawl_internal_links_analysis,"
-echo -e "                       librecrawl_filter_issues"
-echo -e "    Technical SEO    : librecrawl_pagespeed, librecrawl_pagespeed_audit,"
-echo -e "                       librecrawl_pagespeed_audit_all_crawl_pages,"
-echo -e "                       librecrawl_schema_check, librecrawl_schema_audit,"
-echo -e "                       librecrawl_get_settings"
-echo -e "    Reporting        : librecrawl_append_gsc_section,"
-echo -e "                       librecrawl_visualization_data,"
-echo -e "                       librecrawl_generate_report, librecrawl_report_content"
+echo -e "                       librecrawl_resume_crawl, librecrawl_resume_from_crawl_id"
+echo -e "    Site analysis    : librecrawl_audit (legacy), librecrawl_site_check,"
+echo -e "                       librecrawl_full_audit_strict, librecrawl_internal_links_analysis,"
+echo -e "                       librecrawl_filter_issues, librecrawl_visualization_data,"
+echo -e "                       librecrawl_get_settings, librecrawl_brain_purge_audit"
 echo ""
 echo -e "  ${BOLD}First audit:${NC} Ask your AI agent: \"Audit https://example.com\""
+echo -e "                 (Server instructions tell the LLM exactly how to drive the chunked audit + save the zip locally.)"
 echo -e "  ${BOLD}Test:${NC}"
 echo -e "  pm2 status ${PM2_NAME}"
 echo -e "  docker ps | grep librecrawl"
