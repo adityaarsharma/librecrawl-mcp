@@ -148,10 +148,14 @@ CANONICAL_LINK_RE = re.compile(
 SITEMAP_URL_HARD_LIMIT = 50_000   # Google's per-file URL cap
 SITEMAP_SIZE_HARD_LIMIT_BYTES = 50 * 1024 * 1024   # 50 MB uncompressed
 
-# Hreflang code validation. Approximation: ISO 639-1 (2-letter) optional
-# -Aa-Zz (script) optional -ZZ (region) or "x-default".
+# Hreflang code validation. ISO 639-1 (2-letter) lang + optional 4-letter
+# script + optional 2-letter or 3-digit region. Case-insensitive — Google's
+# docs accept "en-US" and "en-us" both. Cloudflare and many other major
+# sites use lowercase region, so a strict-uppercase pattern is a false
+# positive factory.
 VALID_HREFLANG_RE = re.compile(
-    r'^(?:x-default|[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|\d{3}))?)$',
+    r'^(?:x-default|[a-z]{2,3}(?:-[a-z]{4})?(?:-(?:[a-z]{2}|\d{3}))?)$',
+    re.IGNORECASE,
 )
 
 # Localhost / private-IP outbound link detection
@@ -405,10 +409,16 @@ def _check_hreflang_full(pages: list) -> list:
                 out.append((u_raw, "hreflang_invalid_codes",
                             f"Invalid hreflang code: '{lang}' (expected ISO 639-1 / 3166-1)"))
                 break
-        # hreflang_conflicts_lang_attr: hreflang language disagrees with <html lang=>
+        # hreflang_conflicts_lang_attr: hreflang language disagrees with <html lang=>.
+        # v2.0.5 — only consider NON-x-default self-entries. On home pages, the
+        # canonical-lang entry AND x-default often share the same URL, so the
+        # original next() would sometimes pick x-default (whose code doesn't
+        # startswith any language) → false-positive at ~50% rate on cloudflare.com.
         if page_lang_attr:
             page_lang_base = page_lang_attr.split("-")[0]
-            self_entry = next((e for e in entries if e[1] == u), None)
+            self_matches = [e for e in entries if e[1] == u]
+            non_default = [e for e in self_matches if (e[0] or "").lower() != "x-default"]
+            self_entry = non_default[0] if non_default else None
             if self_entry and self_entry[0] and not self_entry[0].lower().startswith(page_lang_base):
                 out.append((u_raw, "hreflang_conflicts_lang_attr",
                             f"hreflang='{self_entry[0]}' but <html lang='{page_lang_attr}'>"))
