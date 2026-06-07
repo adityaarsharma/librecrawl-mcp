@@ -1,0 +1,12 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.adityaarsharma/librecrawl-technical-seo-audit-mcp",
+  "title": "Librecrawl — Technical SEO Audit MCP Server",
+  "description": "Open-source self-hosted technical SEO audit MCP server built on the LibreCrawl engine. Runs full audits inside Claude, Cursor, or Codex — 37 tools, 50+ checks per audit (hreflang, schema.org Rich Results, security headers, image performance, WAF detection on 200-OK pages), chunked-progressive crawler so big sites don't time out, branded PDF + 7 sidecar CSVs. Ephemeral by default — server wipes session, artifacts, and upstream record after every download. MIT.",
+  "version": "2.0.5",
+  "websiteUrl": "https://github.com/adityaarsharma/librecrawl-technical-seo-audit-mcp",
+  "repository": {
+    "url": "https://github.com/adityaarsharma/librecrawl-technical-seo-audit-mcp",
+    "source": "github"
+  }
+}

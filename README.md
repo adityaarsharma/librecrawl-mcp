@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.adityaarsharma/librecrawl-technical-seo-audit-mcp -->
+
 <div align="center">
 
 # 🕷️ librecrawl-technical-seo-audit-mcp
