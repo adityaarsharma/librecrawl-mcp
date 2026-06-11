@@ -321,7 +321,7 @@ def _run_coro(coro):
 # ── Public entry point ───────────────────────────────────────────────────────
 
 def audit_content(pages: list, output_path: Path, limit: int = 400,
-                   max_workers: int = 8,
+                   max_workers: int = 4,
                    timeout_seconds: float = 20.0) -> dict:
     """
     Run paragraph-level content checks across the first `limit` pages of a

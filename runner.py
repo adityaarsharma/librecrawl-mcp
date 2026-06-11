@@ -261,16 +261,18 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     if fill_enabled and pre_recon.get("sitemap_only_count", 0) > 0:
         try:
             import sitemap_fill
-            # v2.0.8: heavy-site defaults. Pages on Elementor/heavy-WP sites
-            # can be 4-5 MB each — an 8s fetch timeout silently dropped them
-            # to status 0 (theplusaddons.com: 1907/1936 sitemap URLs timed out
-            # at 8s). 25s + more workers lets heavy pages actually fetch. Both
-            # tunable per audit via settings (fetch_timeout_s / fetch_workers).
+            # v2.0.9: Screaming-Frog-grade politeness for heavy sites.
+            # Heavy pages (4-5 MB) need more TIME (25s timeout), NOT more
+            # PARALLELISM. v2.0.8 wrongly raised workers to 16 → ~75 MB
+            # concurrent transfer slowed theplusaddons.com. Corrected: LOW
+            # concurrency (4 workers, SF's 2-5 range) + 500ms jittered
+            # per-request delay. All tunable per audit via settings.
             fill_result = sitemap_fill.fill_sitemap_orphans(
                 pre_recon.get("sitemap_only", []),
-                max_workers=int(settings.get("fetch_workers", 16)),
+                max_workers=int(settings.get("fetch_workers", 4)),
                 timeout_seconds=float(settings.get("fetch_timeout_s", 25.0)),
                 cap=fill_cap,
+                delay_ms=float(settings.get("fetch_delay_ms", 500.0)),
             )
             new_pages = fill_result.get("pages_added", []) or []
             pages = pages + new_pages
@@ -345,9 +347,12 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     try:
         import external_links
         ext_csv = REPORTS_DIR / f"{domain}-{timestamp}.external-links.csv"
+        # External links span MANY hosts (not one origin), so concurrency is
+        # safer here — but still capped at 8 to stay polite to any single
+        # heavily-linked destination.
         ext_summary = external_links.audit_external_links(
             pages, url, ext_csv, links=links,
-            max_workers=int(settings.get("fetch_workers", 16)),
+            max_workers=int(settings.get("external_fetch_workers", 8)),
             timeout_seconds=float(settings.get("fetch_timeout_s", 20.0)),
         )
         state.add_artifact(sid, "external_links_csv", ext_csv)

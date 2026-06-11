@@ -24,6 +24,7 @@ source="sitemap_fill" so downstream tools can opt-in/out as needed.
 """
 
 import asyncio
+import random
 import re
 import time
 from html.parser import HTMLParser
@@ -349,11 +350,30 @@ async def _fetch_one(url: str, client: httpx.AsyncClient,
 
 
 async def _fill_async(urls: list, max_workers: int,
-                       timeout_s: float) -> list:
+                       timeout_s: float, delay_ms: float = 500.0) -> list:
+    """Politely fetch the orphan-URL list.
+
+    v2.0.9 politeness (matches Screaming Frog's 2-5 thread / per-request-delay
+    model and the polite-crawler standard of 500-3000ms + jitter):
+
+      - LOW concurrency (max_workers default 4) so we never open a flood of
+        simultaneous connections to one origin. This is the primary load
+        control — heavy pages (4-5 MB) at high concurrency saturate origin
+        bandwidth (the v2.0.8 regression: 16 workers x 4.68 MB = ~75 MB
+        concurrent, which slowed theplusaddons.com noticeably).
+      - Per-request delay with ±50% jitter, applied inside the semaphore, to
+        smooth bursts and avoid a synchronized thundering herd.
+      - Heavy pages still succeed because the per-page TIMEOUT stays generous
+        (25s) — we give each page more TIME, not more PARALLELISM.
+    """
     sem = asyncio.Semaphore(max_workers)
+    base_delay = max(0.0, delay_ms / 1000.0)
     async with httpx.AsyncClient(http2=False, verify=True) as client:
         async def _bounded(u):
             async with sem:
+                if base_delay > 0:
+                    # jitter 0.5x–1.5x of base to de-synchronise workers
+                    await asyncio.sleep(base_delay * (0.5 + random.random()))
                 return await _fetch_one(u, client, timeout_s)
         return await asyncio.gather(*(_bounded(u) for u in urls),
                                     return_exceptions=False)
@@ -383,18 +403,24 @@ def _run_coro(coro):
 
 
 def fill_sitemap_orphans(missed_urls: list,
-                          max_workers: int = 16,
+                          max_workers: int = 4,
                           timeout_seconds: float = 25.0,
-                          cap: int = 500) -> dict:
+                          cap: int = 500,
+                          delay_ms: float = 500.0) -> dict:
     """Synchronous entry — drives the async pool internally.
 
     Args:
         missed_urls:  recon.sitemap_only URL list.
-        max_workers:  concurrent fetches (default 10).
-        timeout_seconds: per-request timeout (default 8s).
+        max_workers:  concurrent fetches (default 4 — Screaming-Frog-grade
+                      politeness; low concurrency is the primary load control
+                      so heavy origins aren't saturated).
+        timeout_seconds: per-request timeout (default 25s — heavy pages get
+                      more TIME, not more parallelism).
         cap:          hard ceiling on URLs to fetch (default 500). Avoids
                       runaway cost on huge sitemaps. Set higher only when
                       you actively want coverage of all sitemap entries.
+        delay_ms:     per-request politeness delay with ±50% jitter (default
+                      500ms; matches the 500-3000ms polite-crawler standard).
 
     Returns:
         pages_added: list of page dicts (LibreCrawl-export-shaped)
@@ -414,7 +440,7 @@ def fill_sitemap_orphans(missed_urls: list,
     # running. This is THE fix that restores full sitemap coverage on
     # force-advanced audits (was silently capped at internally-linked pages).
     pages = _run_coro(
-        _fill_async(targets, max_workers, timeout_seconds)
+        _fill_async(targets, max_workers, timeout_seconds, delay_ms)
     )
 
     success = sum(1 for p in pages
